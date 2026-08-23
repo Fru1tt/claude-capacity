@@ -12,6 +12,7 @@ $ python3 gate.py check --max-pct 80
 GO -- every live window is under 80%: five-hour at 32%, seven-day at 72%
   five-hour   32.0%  resets in 120 min  measured 0 min ago
   seven-day   72.0%  resets in 4320 min  measured 0 min ago
+  context     41.2%  measured 0 min ago
 $ echo $?
 0
 ```
@@ -48,7 +49,14 @@ first API response in that session.
 $ python3 gate.py show
 ```
 
-Before step 3, `show` reports `UNKNOWN — the ledger holds no usable reading`.
+Before step 3, `show` reports:
+
+```console
+UNKNOWN -- the ledger holds no usable reading -- nothing has been captured, or every window in it has already reset
+  five-hour  no live reading
+  seven-day  no live reading
+```
+
 That is it working: it has nothing yet and says so rather than inventing a number.
 
 The ledger goes to the usual place for your platform
@@ -60,6 +68,7 @@ Linux, `APPDATA` on Windows). `CLAUDE_CAPACITY_STORE` overrides it.
 ```console
 $ python3 gate.py check --max-pct 80        # exit 0 to go, 1 to wait
 $ python3 gate.py check --max-context 70    # also wait on a nearly full context window
+                                            # (a stale context reading gives UNKNOWN, not a pass)
 $ python3 gate.py check --json              # the full answer, for a script to parse
 $ python3 gate.py show                      # where you stand right now
 $ python3 gate.py compact                   # shrink an old ledger
@@ -88,8 +97,13 @@ weeks and set the limit below the point where you have actually run out mid-sess
 
 ## How it picks a reading
 
-Each render records what both windows looked like at that moment. Reading them
-back is not simply "take the newest row", for three reasons worth knowing:
+A render records what both windows looked like at that moment — though not every
+render writes a row. Rendering happens constantly, so a row is written at most
+once a minute, unless a percentage has moved by a point or more, which is real
+movement and outranks that throttle.
+
+Reading those rows back is not simply "take the newest one", for three reasons
+worth knowing:
 
 **A row can be half stale.** One render carries a reading for each window, and
 the five-hour reading can still be current while the seven-day reading beside it
@@ -115,20 +129,30 @@ and one such value would otherwise outrank every genuine row.
 
 ## When it says it does not know
 
-If the ledger holds no live reading, or the newest is older than `--max-age`, the
-answer is `UNKNOWN` and the exit code is 1. Not knowing how much is left is not
-the same as knowing there is room. A stale ledger usually means the status line
-stopped running, which is exactly when a naive tool reads an old low number and
-launches everything.
+If the ledger holds no live reading, the answer is `UNKNOWN` and the exit code is
+1. The same happens when any live window's reading is older than `--max-age` —
+the rule is applied per window, so a fresh five-hour reading still gives `UNKNOWN`
+if the seven-day reading beside it has gone stale.
+
+Not knowing how much is left is not the same as knowing there is room. A stale
+ledger usually means the status line stopped running, which is exactly when a
+naive tool reads an old low number and launches everything.
 
 Pass `--allow-unknown` to start anyway.
 
 ## What it does not do
 
 **No provider status or overage flag.** Those exist, but not in the status-line
-payload — the agent toolkit's own type definitions put them on a rate-limit event
-in the CLI's streaming output, a channel a status line never receives. Each window
-here carries a percentage and a reset time, and that is all there is to read.
+payload. Each window there carries `used_percentage` and `resets_at`, and that is
+all — see the [status line
+documentation](https://code.claude.com/docs/en/statusline). The status and overage
+fields live on a rate-limit event in the CLI's streaming output, a channel a status
+line never receives; the agent toolkit's own type definitions show where they
+belong, and you can check that yourself without trusting me:
+
+```console
+$ npm pack @anthropic-ai/claude-agent-sdk && tar -xzOf anthropic-ai-claude-agent-sdk-*.tgz package/sdk.d.ts | grep -i ratelimit
+```
 
 **No credential or endpoint access.** Payload only. Reading a token out of a
 keychain to call an undocumented usage endpoint gets more data and breaks worse.
@@ -142,20 +166,29 @@ there is room at all, depends on things a ledger does not know.
 ## Limits
 
 The quota fields only appear for Claude.ai subscribers, and only after the first
-API response in a session. On an API-key setup there is nothing to read, and this
-says so rather than inventing a number.
+API response in a session. On an API-key setup there is nothing to read, so the
+answer is `UNKNOWN` — though the reason it prints assumes a ledger that once had
+readings and does not name this case specifically.
 
 The payload schema is Anthropic's. It is documented, but fields have been added
 across releases, so every field is treated as possibly absent and each row records
 a schema version.
 
 Only the five-hour and seven-day windows are understood, because only those two
-are documented. Another window would be ignored rather than misread.
+are documented. If a third is ever added, this will not see it — and an unseen
+window is not harmless, because the answer would then describe room that may not
+exist. If you hear a new window has appeared, treat this as wrong until it has
+been taught about it.
 
 The append is one small write to a descriptor opened for append, which a local
-filesystem makes atomic against other writers. Advisory locks are unreliable on
-network filesystems, and on Windows there is no lock at all, so concurrent renders
-there can lose a row to the throttle check.
+filesystem makes atomic against other writers — measured at 80 simultaneous
+appends with the lock disabled entirely: 80 lines, none torn. The advisory lock
+on top of that is what stops two renders from both deciding the throttle has
+expired. Advisory locks are unreliable on network filesystems, and on Windows
+there is no lock at all, so concurrent renders there can write a duplicate row
+the throttle should have suppressed.
+
+The ledger does not rotate itself. `compact` runs only when you run it.
 
 ## Similar projects
 

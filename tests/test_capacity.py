@@ -185,6 +185,13 @@ for name, call in (
         ("build_row(reset near year 1)",
          lambda: capture.build_row({"rate_limits": {"five_hour": {
              "used_percentage": 50, "resets_at": "0001-01-01T00:00:00Z"}}})),
+        # build_row reached straight into the payload with .get, so anything
+        # that was not a dict came back as AttributeError from inside a module
+        # whose first stated property is that it may never raise. Every other
+        # entry point in that file already guards this.
+        ("build_row(a number)", lambda: capture.build_row(7)),
+        ("build_row(a list)", lambda: capture.build_row([1, 2])),
+        ("build_row(None)", lambda: capture.build_row(None)),
         ("reading(now=naive)", lambda: ledger.reading(path=LEDGER, now=NAIVE)),
         ("capacity(now=naive)", lambda: gate.capacity(path=LEDGER, now=NAIVE)),
         ("append(not a dict)", lambda: capture.append(None, path=LEDGER))):
@@ -197,6 +204,8 @@ for name, call in (
 check("a naive now is read as UTC rather than refused",
       gate.capacity(path=LEDGER, now=NAIVE)["checked_at"],
       iso(NOW))
+check("a payload that is not an object becomes a row with no readings in it",
+      [k for k in capture.build_row(7, now=NOW) if k.endswith("_pct")], [])
 
 print("\n== a store that cannot be written costs the row, never the line ==")
 blocked = SCRATCH / "a-file"
@@ -248,6 +257,33 @@ write([{"v": 1, "ts": iso(NOW - timedelta(minutes=m)),
 found = ledger.reading(path=LEDGER, now=NOW)
 check("58 per cent, not the 15 that a first-match rule would keep",
       found["seven_day"]["pct"], 58)
+
+print("\n== across a window boundary, and why the reset ranks first ==")
+# The one shape where the reset and the observation time could pull apart: the
+# older row is the end of the window that has just run out, the newer row the
+# start of the one that replaced it. The new window's reset is LATER and its
+# percentage much LOWER, which is why ranking the reset first is safe here --
+# the two orderings agree, because a reset never moves backwards for a window.
+# Measured 2026-08-23, enumerating every three-row ledger whose resets are
+# non-decreasing: 4,320 ledgers, 0 answers on which reset-first and
+# newest-first disagree. Reopen if a window's reset is ever seen to jitter
+# between renders; reset-first would then start preferring an older row.
+rolled = NOW + timedelta(hours=5)
+write([{"v": 1, "ts": iso(NOW - timedelta(minutes=3)), "five_hour_pct": 96,
+        "five_hour_reset": iso(NOW + timedelta(minutes=1))},
+       {"v": 1, "ts": iso(NOW - timedelta(minutes=1)), "five_hour_pct": 4,
+        "five_hour_reset": iso(rolled)}])
+found = ledger.reading(path=LEDGER, now=NOW)
+check("the new window's 4 per cent answers, not the spent window's 96",
+      found["five_hour"]["pct"], 4)
+check("and the reset reported is the new window's",
+      found["five_hour"]["reset"], iso(rolled))
+check("so the gate lets the work start",
+      gate.capacity(path=LEDGER, now=NOW, max_pct=80)["verdict"], gate.GO)
+# One minute later the spent window's row is not even a candidate.
+check("and once the old reset has passed, that row is simply gone",
+      ledger.reading(path=LEDGER,
+                     now=NOW + timedelta(minutes=2))["five_hour"]["pct"], 4)
 
 print("\n== two renders in the same second, which the throttle allows ==")
 # `ts` has one-second resolution, and a percentage that moved by a point or more
@@ -307,6 +343,26 @@ check("the context percentage comes from the newest row",
 check("and so does the cost, not from whatever came last in the file",
       found["cost_usd"], 9.99)
 check("and so does the model id", found["model_id"], "new-model")
+
+# Same second, two rows -- which is what an ordinary capture produces, not a
+# hand-edited ledger: `ts` has one-second resolution and a percentage that moved
+# by a point or more outranks the throttle. The window selection was given a
+# file-position tie-break for exactly this; these three were left on a strict >
+# of the timestamp alone, which keeps the row seen FIRST, and in an append-only
+# file that is the older write.
+write([{"v": 1, "ts": iso(NOW), "context_pct": 10, "cost_usd": 0.01,
+        "model_id": "old-model", "five_hour_pct": 70,
+        "five_hour_reset": iso(soon)},
+       {"v": 1, "ts": iso(NOW), "context_pct": 90, "cost_usd": 9.99,
+        "model_id": "new-model", "five_hour_pct": 85,
+        "five_hour_reset": iso(soon)}])
+found = ledger.reading(path=LEDGER, now=NOW)
+check("identical timestamps: the context reading is the later WRITE's",
+      found["context_pct"], 90)
+check("identical timestamps: so is the cost", found["cost_usd"], 9.99)
+check("identical timestamps: so is the model id", found["model_id"], "new-model")
+check("all four readings settle a tie the same way",
+      found["five_hour"]["pct"], 85)
 
 print("\n== the offset changes twice a year and string order breaks ==")
 write([
@@ -372,6 +428,36 @@ answer = gate.capacity(path=LEDGER, now=NOW, max_pct=80, max_context_pct=50)
 check("a full context window can hold work back when asked to",
       answer["verdict"], gate.WAIT)
 
+print("\n== the context rule needs a context reading it can date ==")
+# The context number never carried a measurement time, so --max-context was
+# applied to a reading of unbounded age: here a nine-hour-old 95% beside a
+# one-minute-old window reading. The staleness rule covered the two quota
+# windows and nothing else, and nothing reported the context reading's age
+# either, so no caller could have noticed.
+write([{"v": 1, "ts": iso(NOW - timedelta(hours=9)), "context_pct": 95},
+       {"v": 1, "ts": iso(NOW - timedelta(minutes=1)), "five_hour_pct": 5,
+        "five_hour_reset": iso(soon)}])
+found = ledger.reading(path=LEDGER, now=NOW)
+check("the reading says when the context number was measured",
+      found["context_measured_at"], iso(NOW - timedelta(hours=9)))
+check("and how old that makes it", found["context_age_minutes"], 540.0)
+answer = gate.capacity(path=LEDGER, now=NOW, max_age_minutes=30,
+                       max_context_pct=50)
+check("a nine-hour-old context number decides nothing, in either direction",
+      answer["verdict"], gate.UNKNOWN)
+check("and the reason says it is the context reading that is out of date",
+      "context" in answer["why"] and "540" in answer["why"], True)
+check("the age is reported whether or not anyone gated on it",
+      gate.capacity(path=LEDGER, now=NOW)["context_age_minutes"], 540.0)
+check("and a stale context reading only stops a caller who asked about it",
+      gate.capacity(path=LEDGER, now=NOW, max_age_minutes=30)["verdict"],
+      gate.GO)
+write([{"v": 1, "ts": iso(NOW - timedelta(minutes=2)), "context_pct": 95,
+        "five_hour_pct": 5, "five_hour_reset": iso(soon)}])
+check("while a fresh context reading still holds the work back",
+      gate.capacity(path=LEDGER, now=NOW, max_age_minutes=30,
+                    max_context_pct=50)["verdict"], gate.WAIT)
+
 print("\n== fail closed on silence and on staleness ==")
 LEDGER.unlink(missing_ok=True)
 answer = gate.capacity(path=LEDGER, now=NOW)
@@ -398,6 +484,34 @@ check("an unevenly stale ledger names the window it is talking about",
       "seven-day reading is 400 minutes old" in answer["why"], True)
 check("and does not describe the oldest reading as the newest one",
       "newest reading" in answer["why"], False)
+
+print("\n== a reading stamped in the future is not a fresh reading ==")
+# Freshness was bounded from above only, so a row from a machine whose clock
+# runs ahead has a NEGATIVE age, passes every staleness test, and goes on
+# deciding for as long as it sits in the tail. capture already refuses a reset
+# that runs further ahead than any real window; nothing guarded the row's own
+# observation time.
+write([{"v": 1, "ts": iso(NOW + timedelta(hours=3)), "five_hour_pct": 2,
+        "five_hour_reset": iso(NOW + timedelta(hours=4))}])
+answer = gate.capacity(path=LEDGER, now=NOW, max_age_minutes=30)
+check("a row stamped three hours ahead is not permission to start",
+      answer["verdict"], gate.UNKNOWN)
+check("and the reason says the stamp is ahead, not that it is old",
+      "future" in answer["why"], True)
+check("it does not blame the status line for a clock problem",
+      "status line" in answer["why"], False)
+check("a skew inside the age you allow is still usable",
+      gate.capacity(path=LEDGER, max_age_minutes=30,
+                    now=NOW + timedelta(hours=3) - timedelta(minutes=5)
+                    )["verdict"], gate.GO)
+# Both windows out of true, one each way: the message names the worse of them.
+write([{"v": 1, "ts": iso(NOW + timedelta(minutes=500)),
+        "seven_day_pct": 20, "seven_day_reset": iso(later)},
+       {"v": 1, "ts": iso(NOW - timedelta(minutes=40)),
+        "five_hour_pct": 12, "five_hour_reset": iso(soon)}])
+answer = gate.capacity(path=LEDGER, now=NOW, max_age_minutes=30)
+check("the furthest-out reading is the one named, whichever way it is out",
+      "seven-day" in answer["why"] and "500" in answer["why"], True)
 
 print("\n== the exit codes, which are the whole interface ==")
 env = dict(os.environ, CLAUDE_CAPACITY_STORE=str(SCRATCH))
@@ -482,6 +596,13 @@ check("twelve simultaneous renders left no torn line", torn, 0)
 check("and at least one of them was recorded", len(raw) >= 1, True)
 
 print("\n== rotation keeps the newest and never loses the file ==")
+# The tail cannot see history that compaction has already thrown away, so a
+# TAIL_ROWS above KEEP_ROWS is a promise the file cannot keep. This is the
+# invariant behind the corrected comment on TAIL_ROWS: 4000 rows is 2.8 days at
+# one row a minute, not the seven days it used to claim, and raising it to
+# 10,080 without raising KEEP_ROWS would have bought nothing at all.
+check("the tail never asks for more history than compaction keeps",
+      ledger.TAIL_ROWS <= ledger.KEEP_ROWS, True)
 write([{"v": 1, "ts": iso(NOW - timedelta(minutes=n)), "five_hour_pct": 1,
         "five_hour_reset": iso(soon), "pad": "x" * 200} for n in range(400, 0, -1)])
 check("a small ledger is left alone",
@@ -570,6 +691,63 @@ check("and 'written' meant it -- the row is in the file that survived",
       "survivor" in RACE_LEDGER.read_text(), True)
 check("so the reader can actually see it",
       ledger.reading(path=RACE_LEDGER, now=NOW)["five_hour"]["pct"], 99)
+
+print("\n== a compaction that waited for the lock rechecks what it holds ==")
+# The other half of the same inode problem. `capture._open_locked` was taught to
+# notice that the file it locked is no longer the file at the path; `compact`
+# was not, so a second compaction that had been waiting woke up holding an
+# exclusive lock on a file that had just been renamed away -- and then did its
+# read, rewrite and replace with no lock on the live ledger at all, while a real
+# appender held that lock and believed it had the file to itself.
+#
+# Staged rather than raced: this test holds the locks itself, so the loss is
+# certain rather than lucky. Skipped where there are no advisory locks to take.
+if ledger.fcntl is not None:
+    import fcntl                                            # noqa: E402
+    LOCK_LEDGER = SCRATCH / "lockrace.jsonl"
+    write([{"v": 1, "ts": iso(NOW), "five_hour_pct": 1,
+            "five_hour_reset": iso(soon), "pad": "x" * 300} for _ in range(500)],
+          path=LOCK_LEDGER)
+
+    def _dawdling_rows(path, tail=ledger.TAIL_ROWS):
+        got = real_rows(path, tail=tail)
+        time.sleep(0.6)          # read, then dawdle before the replace
+        return got
+
+    held_old = os.open(str(LOCK_LEDGER), os.O_RDONLY)
+    fcntl.flock(held_old, fcntl.LOCK_EX)     # the ledger everyone starts on
+    staged = {}
+    ledger._rows = _dawdling_rows
+    try:
+        worker = threading.Thread(
+            target=lambda: staged.update(
+                compact=ledger.compact(path=LOCK_LEDGER, max_bytes=100, keep=50)))
+        worker.start()
+        time.sleep(0.3)                      # it is now blocked on that lock
+        # Someone else's compaction lands: a brand-new file at the same path.
+        REPLACEMENT = SCRATCH / "replacement.jsonl"
+        write([{"v": 1, "ts": iso(NOW), "five_hour_pct": 1,
+                "five_hour_reset": iso(soon)} for _ in range(50)],
+              path=REPLACEMENT)
+        os.replace(str(REPLACEMENT), str(LOCK_LEDGER))
+        # An appender takes the lock on the file that is actually there now.
+        held_new = os.open(str(LOCK_LEDGER), os.O_WRONLY | os.O_APPEND)
+        fcntl.flock(held_new, fcntl.LOCK_EX)
+        os.close(held_old)                   # the waiting compaction wakes up
+        time.sleep(0.2)
+        os.write(held_new, (json.dumps(
+            {"v": 1, "ts": iso(NOW), "five_hour_pct": 99,
+             "five_hour_reset": iso(soon), "model_id": "late-arrival"}) + "\n"
+        ).encode("utf-8"))
+        os.close(held_new)                   # and only now is the lock free
+        worker.join()
+    finally:
+        ledger._rows = real_rows
+    check("the waiting compaction still ran", staged.get("compact"), "compacted")
+    check("and the row written under the lock it should have waited for survives",
+          "late-arrival" in LOCK_LEDGER.read_text(), True)
+    check("so the reader sees the 99 per cent, not a go on stale rows",
+          ledger.reading(path=LOCK_LEDGER, now=NOW)["five_hour"]["pct"], 99)
 
 shutil.rmtree(SCRATCH, ignore_errors=True)
 print("\n%s" % ("ALL PASS" if not FAILS else "%d FAILED: %s" % (len(FAILS), FAILS)))

@@ -231,7 +231,17 @@ def _model(payload):
 def build_row(payload, now=None):
     """One payload becomes one row. Absent fields are absent, never zero --
     a window Claude Code did not send is not a window at nought per cent.
+
+    A payload that is not an object is read as an EMPTY one, which yields a row
+    carrying only its schema and its stamp. `render` already refuses a non-dict
+    before it gets here, but this function is public and the readers below it
+    (`_window`, `_context`, `_cost`, `_model`) each guard their own slice of the
+    payload -- so reaching into it with `.get` on the way in was the one
+    unguarded step, and it turned `build_row(7)` into an AttributeError out of a
+    module whose first property is that it may never raise.
     """
+    if not isinstance(payload, dict):
+        payload = {}
     now = aware(now) or datetime.now(timezone.utc).astimezone()
     five_pct, five_reset = _window(payload, "five_hour", now)
     week_pct, week_reset = _window(payload, "seven_day", now)
@@ -320,8 +330,11 @@ def _is_file_at(handle, path):
     return (held.st_dev, held.st_ino) == (there.st_dev, there.st_ino)
 
 
-def _open_locked(path):
-    """A descriptor open for append on `path`, holding the exclusive lock.
+APPEND_FLAGS = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+
+
+def _open_locked(path, flags=APPEND_FLAGS):
+    """A descriptor open on `path` under `flags`, holding the exclusive lock.
 
     A LOCK LIVES ON AN INODE, NOT ON A NAME. `compact` replaces the ledger by
     rename, so an appender that blocked on the lock can wake up holding it on a
@@ -334,10 +347,19 @@ def _open_locked(path):
     once if they have parted company. Once, not in a loop: a second replacement
     inside one lock wait is not worth an unbounded retry, and a fixed number of
     attempts cannot spin.
+
+    THIS IS THE ONLY COPY OF THAT RULE ON PURPOSE. `ledger.compact` waits for
+    the same lock on the same file and had its own opening code without the
+    check, so the fix lived on one side of the pair only: a compaction that
+    waited would wake holding an exclusive lock on a renamed-away file and then
+    read, rewrite and replace the live ledger with no lock on it at all, while a
+    real appender held that lock and believed it had the file to itself. Hence
+    `flags`, so the reader can take the lock through this function rather than
+    keeping a second, drifting copy of the rule.
     """
     for attempt in (1, 2):
         try:
-            handle = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            handle = os.open(str(path), flags, 0o600)
         except OSError:
             return None
         if fcntl is None:

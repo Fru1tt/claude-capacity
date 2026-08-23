@@ -45,6 +45,40 @@ def _minutes_until(stamp, now):
     return round((moment - now).total_seconds() / 60.0, 1)
 
 
+def _out_of_date(age_minutes, max_age_minutes):
+    """Is a reading of this age unusable? FRESHNESS IS A BAND, NOT A CEILING.
+
+    THE RULE, and the one thing to know about it: a reading counts only while
+    its observation time sits within `max_age` minutes of now IN EITHER
+    DIRECTION. Bounding the age from above alone -- which is what this did --
+    gives a row stamped in the future a NEGATIVE age, so it passes every
+    staleness test there is and goes on being authoritative for as long as it
+    sits in the tail. One machine with a clock running fast, one hand-edited
+    line, and the answer is pinned to whatever that row says.
+
+    Chosen to match what `capture` already does at the other door: a reset
+    further ahead than any window Claude Code has is refused rather than
+    believed (MAX_RESET_AHEAD_DAYS). A time that cannot be true is not evidence.
+    An observation time gets the caller's own `max_age` as its allowance rather
+    than a second number, because a caller who will act on a 30-minute-old
+    reading has already said how far the clocks may be out before a reading
+    stops meaning anything -- and a fresh row from a slightly fast clock, which
+    is the common case, still passes.
+    """
+    return age_minutes is None or abs(age_minutes) > max_age_minutes
+
+
+def _age_words(age_minutes):
+    """How to say an age out loud, in whichever direction it runs."""
+    if age_minutes < 0:
+        return ("stamped %.0f minutes in the future" % abs(age_minutes),
+                "a clock writing this ledger is ahead of this one, so this "
+                "reports not-known rather than trusting it")
+    return ("%.0f minutes old" % age_minutes,
+            "the status line may not be running, so this reports not-known "
+            "rather than guessing")
+
+
 def capacity(path=None, now=None, max_pct=DEFAULT_MAX_PCT,
              max_age_minutes=DEFAULT_MAX_AGE_MINUTES, max_context_pct=None):
     """The structured answer. Always a dict, never an exception.
@@ -56,6 +90,7 @@ def capacity(path=None, now=None, max_pct=DEFAULT_MAX_PCT,
     found = ledger.reading(path=path, now=now)
     out = {"verdict": UNKNOWN, "why": "", "checked_at": now.isoformat(),
            "five_hour": None, "seven_day": None, "context_pct": None,
+           "context_measured_at": None, "context_age_minutes": None,
            "cost_usd": None, "model_id": None, "health": None,
            "max_pct": max_pct, "max_age_minutes": max_age_minutes}
     if not found:
@@ -63,7 +98,8 @@ def capacity(path=None, now=None, max_pct=DEFAULT_MAX_PCT,
                       "captured, or every window in it has already reset")
         return out
 
-    for key in ("context_pct", "cost_usd", "model_id", "health"):
+    for key in ("context_pct", "context_measured_at", "context_age_minutes",
+                "cost_usd", "model_id", "health"):
         out[key] = found.get(key)
     for window in ledger.WINDOWS:
         got = found.get(window)
@@ -78,7 +114,8 @@ def capacity(path=None, now=None, max_pct=DEFAULT_MAX_PCT,
                       "ledger has already passed")
         return out
 
-    stale = [w for w in live if out[w]["age_minutes"] > max_age_minutes]
+    stale = [w for w in live if _out_of_date(out[w]["age_minutes"],
+                                             max_age_minutes)]
     if stale:
         # Name the window and its own age. The earlier wording called this "the
         # newest reading", which was false whenever the two windows were not
@@ -86,12 +123,14 @@ def capacity(path=None, now=None, max_pct=DEFAULT_MAX_PCT,
         # seven-day one 400 minutes old, it announced that the newest reading
         # was 400 minutes old. This line is read in a log at 3am by someone
         # working out why nothing ran, so it says which window is out of date.
-        window = max(stale, key=lambda w: out[w]["age_minutes"])
-        out["why"] = ("the %s reading is %.0f minutes old, past the %.0f "
-                      "allowed -- the status line may not be running, so this "
-                      "reports not-known rather than guessing"
-                      % (window.replace("_", "-"), out[window]["age_minutes"],
-                         max_age_minutes))
+        # Ranked on the SIZE of the error, not its sign, now that a reading can
+        # be out of true in either direction.
+        window = max(stale, key=lambda w: abs(out[w]["age_minutes"]))
+        said, because = _age_words(out[window]["age_minutes"])
+        out["why"] = ("the %s reading is %s, further out than the %.0f minutes "
+                      "allowed -- %s"
+                      % (window.replace("_", "-"), said, max_age_minutes,
+                         because))
         return out
 
     over = [w for w in live if out[w]["pct"] >= max_pct]
@@ -105,12 +144,35 @@ def capacity(path=None, now=None, max_pct=DEFAULT_MAX_PCT,
                          else "; it resets in %.0f minutes" % minutes))
         return out
 
-    if max_context_pct is not None and out["context_pct"] is not None \
-            and out["context_pct"] >= max_context_pct:
-        out["verdict"] = WAIT
-        out["why"] = ("the context window is %.0f%% full, at or past the %.0f%% "
-                      "limit" % (out["context_pct"], max_context_pct))
-        return out
+    if max_context_pct is not None and out["context_pct"] is not None:
+        # THE SAME FRESHNESS RULE AS THE TWO WINDOWS, applied here because this
+        # number decides too. It used to be applied at any age at all: the
+        # staleness check above covered the quota windows only, and the context
+        # reading carried no measurement time, so nothing could have checked it
+        # and nothing reported it. A context percentage and a window percentage
+        # need not come from the same row -- `context_pct` is the fourth thing
+        # shed when a row runs over MAX_ROW_BYTES -- so a nine-hour-old context
+        # number sitting beside a one-minute-old window reading is an ordinary
+        # ledger, not a damaged one.
+        #
+        # Out of date is UNKNOWN here, not "ignore it and go on". A caller who
+        # passed --max-context asked for this to be part of the decision, and
+        # this file's first promise is that not knowing is never permission to
+        # start. Note that a MISSING context reading is still a go: nothing was
+        # ever measured, so there is nothing that has since moved -- while a
+        # reading that exists and is out of date is a number that has.
+        if _out_of_date(out["context_age_minutes"], max_age_minutes):
+            said, because = _age_words(out["context_age_minutes"] or 0.0)
+            out["why"] = ("you asked to be gated on the context window, and "
+                          "that reading is %s, further out than the %.0f "
+                          "minutes allowed -- %s" % (said, max_age_minutes,
+                                                     because))
+            return out
+        if out["context_pct"] >= max_context_pct:
+            out["verdict"] = WAIT
+            out["why"] = ("the context window is %.0f%% full, at or past the "
+                          "%.0f%% limit" % (out["context_pct"], max_context_pct))
+            return out
 
     out["verdict"] = GO
     out["why"] = ("every live window is under %.0f%%: %s" % (
@@ -132,7 +194,14 @@ def _human(answer):
                         "unknown" if minutes is None else "%.0f min" % minutes,
                         got["age_minutes"]))
     if answer.get("context_pct") is not None:
-        lines.append("  %-10s %5.1f%%" % ("context", answer["context_pct"]))
+        # With its age, which is the whole point of recording one: a context
+        # number printed bare cannot be told apart from yesterday's.
+        age = answer.get("context_age_minutes")
+        lines.append("  %-10s %5.1f%%%s"
+                     % ("context", answer["context_pct"],
+                        "" if age is None else
+                        "  measured %.0f min ago" % age if age >= 0 else
+                        "  stamped %.0f min ahead" % abs(age)))
     health = answer.get("health") or {}
     if health.get("unreadable"):
         lines.append("  %-10s %d unreadable row(s) skipped"

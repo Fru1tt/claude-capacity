@@ -65,8 +65,23 @@ WINDOWS = ("five_hour", "seven_day")
 MAX_BYTES = 4 * 1024 * 1024
 KEEP_ROWS = 5000
 
-# How far back a read looks. Enough to cover a seven-day window at the throttled
-# rate without walking a year of history on every call.
+# How far back a read looks. The comment here used to claim this covered a
+# seven-day window at the throttled rate. It does not: at one row a minute seven
+# days is 10,080 rows, and 4,000 is about 2.8 days. THE COMMENT WAS WRONG, NOT
+# THE NUMBER, and the number stays for two reasons.
+#
+# First, tail depth is not what makes a seven-day reading available. The
+# selection rule always prefers the newest live observation, so on a ledger
+# written continuously the answer comes from the last few rows whatever the tail
+# is; a deeper tail changes an answer only in the narrow case where every recent
+# row is missing that window's fields -- which happens when they are shed under
+# MAX_ROW_BYTES pressure, and the quota numbers are the last thing shed.
+#
+# Second, KEEP_ROWS is 5,000, so a compaction has already destroyed everything
+# older than that. Raising this above KEEP_ROWS would ask for history the file no
+# longer holds. Reopen if the quota fields start being shed often enough that a
+# read misses a live reading -- and then raise both constants together, because
+# raising this one alone buys exactly nothing.
 TAIL_ROWS = 4000
 
 
@@ -162,6 +177,30 @@ def reading(path=None, now=None, tail=TAIL_ROWS):
                 # then jamming the answer at not-known once it ages out.
                 unreadable += 1
                 continue
+            # WHY THE RESET RANKS ABOVE THE OBSERVATION TIME, since this reads
+            # backwards and has been challenged. The objection: two live rows a
+            # minute apart, the older claiming 3% with a reset at 19:00, the
+            # newer 97% with an earlier reset -- the older wins, and that is a
+            # false go. True, and unreachable. It needs a window's reset to move
+            # BACKWARDS between renders, and nothing produces that. `resets_at`
+            # arrives as an absolute epoch from the server, so the local clock
+            # and the local zone cannot touch the instant it names (measured
+            # 2026-08-23: one epoch through four zones from Auckland to Los
+            # Angeles, four different local stamps, one identical instant).
+            # Within a window every row carries the same reset; across a
+            # boundary the new window's reset is LATER and its percentage lower,
+            # which is the case this ordering exists to get right.
+            #
+            # And where resets never move backwards the two orderings cannot
+            # disagree at all: measured over every three-row ledger built from a
+            # non-decreasing reset sequence -- 4,320 of them -- reset-first and
+            # newest-first returned the same answer 4,320 times. So this is a
+            # cheap belt on the expiry check above rather than a rule with a
+            # cost. Reopen if a window's reset is ever observed to jitter
+            # between renders by so much as a second: reset-first would then
+            # start preferring whichever row happened to name the latest reset,
+            # which need not be the newest row.
+            #
             # THE THIRD ELEMENT IS THE ROW'S POSITION, AND IT IS LOAD-BEARING.
             # `ts` has one-second resolution, and the throttle deliberately
             # allows a second write inside the same second whenever a percentage
@@ -184,28 +223,51 @@ def reading(path=None, now=None, tail=TAIL_ROWS):
     # instead would be a different question -- newest by position, not by time --
     # and the two disagree on any ledger whose rows are not in time order, which
     # is exactly what the offset change twice a year produces.
-    context, context_at = None, None
-    cost, cost_at = None, None
-    model, model_at = None, None
+    #
+    # THE SAME TIE-BREAK AS THE WINDOWS ABOVE, AND FOR THE SAME REASON. These
+    # three were left ranking on the parsed timestamp alone while the window
+    # selection was given a file-position tie-break, so on the pair of rows an
+    # ordinary capture produces -- same second, because `ts` has one-second
+    # resolution and a percentage that moved outranks the throttle -- a strict >
+    # kept the row seen FIRST, which in an append-only file is the older write.
+    # One reader answering the same "which is newer?" two different ways is not
+    # a rule anybody can hold in their head, so the key is the same tuple here.
+    context, cost, model = None, None, None
+    context_key, cost_key, model_key = None, None, None
+    context_measured_at = None
     newest = None
-    for row in rows:
+    for index, row in enumerate(rows):
         seen_at = _instant(row.get("ts"))
+        key = (seen_at, index)
         if newest is None or seen_at > newest:
             newest = seen_at
         pct = capture._pct(row.get("context_pct"))
-        if pct is not None and (context_at is None or seen_at > context_at):
-            context, context_at = pct, seen_at
+        if pct is not None and (context_key is None or key > context_key):
+            context, context_key = pct, key
+            context_measured_at = row.get("ts")
         spent = row.get("cost_usd")
         if isinstance(spent, (int, float)) and not isinstance(spent, bool) \
-                and (cost_at is None or seen_at > cost_at):
-            cost, cost_at = spent, seen_at
+                and (cost_key is None or key > cost_key):
+            cost, cost_key = spent, key
         ident = row.get("model_id")
-        if isinstance(ident, str) and (model_at is None or seen_at > model_at):
-            model, model_at = ident, seen_at
+        if isinstance(ident, str) and (model_key is None or key > model_key):
+            model, model_key = ident, key
+
+    # WHEN the context number was measured, so that something can check it.
+    # Without this the --max-context rule was applied to a reading of unbounded
+    # age: the staleness check covered the two quota windows, the context number
+    # carried no measurement time at all, and so a context percentage from
+    # yesterday's session decided today's answer with nothing able to notice and
+    # nothing reporting it. The gate applies the same freshness rule to this.
+    context_age = None
+    if context is not None:
+        context_age = round((now - context_key[0]).total_seconds() / 60.0, 1)
 
     out = {"health": {"rows": len(rows), "unreadable": unreadable,
                       "newest": None if newest is None else newest.isoformat()},
-           "context_pct": context, "cost_usd": cost, "model_id": model}
+           "context_pct": context, "context_measured_at": context_measured_at,
+           "context_age_minutes": context_age,
+           "cost_usd": cost, "model_id": model}
     for window in WINDOWS:
         found = best.get(window)
         if not found:
@@ -228,10 +290,16 @@ def compact(path=None, max_bytes=MAX_BYTES, keep=KEEP_ROWS):
     a temporary file followed by a replace, so a crash mid-compaction leaves the
     old ledger whole rather than a half one.
 
-    A row arriving DURING the rewrite is not lost either, but that is `capture`'s
-    doing rather than this function's: an appender that was blocked on the lock
-    wakes up holding it on the replaced file, notices, and reopens. See
-    `capture._open_locked`.
+    A row arriving DURING the rewrite is not lost either, and the lock this
+    takes obeys the same rule the appender does: a lock lives on an inode, not
+    on a name, so whoever waited for it must check that the file it locked is
+    still the file at the path. Two compactions can queue on one ledger -- a
+    `gate compact` and a cron line, or two of the same cron line -- and the one
+    that waited used to wake holding an exclusive lock on a file the first had
+    just renamed away, then read, rewrite and replace the live ledger with no
+    lock on it at all. An appender holding the real lock at that moment would
+    have its row read back and dropped by the rewrite, having been told
+    'written'. Both sides go through `capture._open_locked` for that reason.
     """
     path = Path(path) if path else capture.ledger_path()
     try:
@@ -242,8 +310,9 @@ def compact(path=None, max_bytes=MAX_BYTES, keep=KEEP_ROWS):
     lock, tmp = None, None
     try:
         if fcntl is not None:
-            lock = os.open(str(path), os.O_RDONLY)
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            lock = capture._open_locked(path, os.O_RDONLY)
+            if lock is None:
+                return "failed"
         rows, _ = _rows(path, tail=None)
         # Not `rows[-keep:]`: at keep=0 that is `rows[0:]`, which keeps
         # everything and then reports 'compacted' -- the caller asked for none
@@ -270,10 +339,7 @@ def compact(path=None, max_bytes=MAX_BYTES, keep=KEEP_ROWS):
             except OSError:
                 pass
         if lock is not None:
-            try:
-                fcntl.flock(lock, fcntl.LOCK_UN)
-            finally:
-                os.close(lock)
+            capture._release(lock)
 
 
 if __name__ == "__main__":
