@@ -1,11 +1,17 @@
 # claude-capacity
 
-Stop your Claude Code automation from launching into an empty tank.
+[![tests](https://github.com/Fru1tt/claude-capacity/actions/workflows/tests.yml/badge.svg)](https://github.com/Fru1tt/claude-capacity/actions/workflows/tests.yml)
 
-Scheduled Claude Code work — a nightly agent, a cron job, anything running
-while you sleep — starts whether or not your subscription's quota can carry it.
-This is the go/no-go in front of it: it reads the quota numbers Claude Code
-already gives your status line, and answers with an exit code:
+Make your Claude Code automation quota-aware.
+
+A subscription is a set of tanks that refill on a schedule — five hours, a
+week, a week per model. You can see the gauges; the work you schedule cannot.
+So the 2am job launches into a spent week, burns what is left, and the session
+you sit down to in the morning opens against a dead limit.
+
+This is the gauge reader. It records the quota numbers Claude Code already
+gives your status line, and answers one question with an exit code — is there
+room to start?
 
 ```console
 $ python3 gate.py check --max-pct 80 --quiet && ./run-the-overnight-job
@@ -23,12 +29,20 @@ WAIT -- seven-day-opus is at 96%, at or past the 80% limit; it resets in 5760 mi
   context           41.2%  measured 0 min ago
 ```
 
-That buys you two things. The dead hours become safe for heavy work: a 2am job
-runs only when the week has room, and its five-hour window has reset before you
-sit down — the night spends weekly quota, never your morning. And the cap is a
-budget: gate automation at 60% and it stops launching while 40% is still yours.
+Once your automation can read the gauges, quota stops being weather and
+becomes something you spend on purpose:
 
-Python 3.9 or later. No dependencies.
+- **Own the night.** A 2am job runs only when the week has room — and its
+  five-hour window has reset before you sit down. The night spends weekly
+  quota, never your morning.
+- **Give automation a budget.** Gate it at 60% and it stops launching while
+  40% is still yours.
+- **Put it in front of anything.** It is an exit code: cron, a queue worker,
+  a build step, any script that spends your quota unattended.
+
+Python 3.9 or later. No dependencies. And only the recorder knows about
+Claude — a second recorder writing the same shape of row, from any tool,
+is gated identically.
 
 ## Install
 
@@ -58,7 +72,7 @@ $ python3 gate.py check --max-pct 80        # exit 0 to go, 1 to wait
 $ python3 gate.py check --max-context 70    # also wait on a full context window
 $ python3 gate.py check --json              # the full answer, for a script
 $ python3 gate.py show                      # where you stand
-$ python3 gate.py compact                   # shrink an old file
+$ python3 gate.py compact                   # trim by hand (it also trims itself)
 ```
 
 In cron:
@@ -90,12 +104,12 @@ same evening numbers as the first.
 **Use `check`, not `show`.** Only `check` puts the answer in its exit code.
 `show` always exits 0.
 
-**The ledger grows until you compact it.** One row per status-line render, in a
-data directory `register` names — on a Mac,
-`~/Library/Application Support/claude-capacity/`. A busy month of open sessions
-is a few megabytes. Nothing compacts automatically, and `compact` does nothing
-until the file is past 4 MB. Readers only walk the newest rows, so an
-uncompacted file costs disk, never a wrong answer.
+**The file looks after itself.** One row per status-line render, in a data
+directory `register` names — on a Mac,
+`~/Library/Application Support/claude-capacity/`. When it passes 4 MB, the
+write that noticed trims it to the newest 5,000 rows; `compact` does the same
+by hand, and does nothing below the threshold. Readers only walk the newest
+rows either way.
 
 **It reads every window Claude Code sends**, not a fixed list. The docs describe
 two — the five-hour session and the all-models week — but recent builds also send
