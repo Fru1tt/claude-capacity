@@ -77,6 +77,9 @@ $ python3 gate.py check --max-pct 80        # exit 0 to go, 1 to wait
 $ python3 gate.py check --max-context 70    # also wait on a full context window
 $ python3 gate.py check --protect 08:00     # never start what would hold the
                                             # five-hour window at eight
+$ python3 gate.py check --protect 08:00 --protect-slack 120
+                                            # ...unless its window dies within
+                                            # two hours after eight
 $ python3 gate.py check --json              # the full answer, for a script
 $ python3 gate.py show                      # where you stand
 $ python3 gate.py compact                   # trim by hand (it also trims itself)
@@ -113,8 +116,11 @@ same evening numbers as the first.
 
 **`--protect` outranks everything**, including not knowing: inside the five
 hours before a protected time the answer is wait, whatever the ledger says.
-The time is this machine's local clock, and on the one night a year the
-clocks change the boundary can be off by an hour.
+A window that dies minutes after the hour steals no morning, though — so
+`--protect-slack 120` tolerates one running up to two hours past it. The
+refusal is about overhang, not existence. The time is this machine's local
+clock, and on the one night a year the clocks change the boundary can be off
+by an hour.
 
 **The file looks after itself.** One row per status-line render, in a data
 directory `register` names — on a Mac,
@@ -161,7 +167,13 @@ Worth a look before you use this one:
 [Ike-li/claude-quota-guard](https://github.com/Ike-li/claude-quota-guard),
 [raysonmeng/agent-quota-guard](https://github.com/raysonmeng/agent-quota-guard).
 
-## Tests
+## Design
+
+Three files, no dependencies. The recorder may never raise — a status line
+that throws is a dead status line, so every failure degrades to a plain
+string. The gate fails closed — not knowing is never permission to start.
+Every claim above is pinned by a test, and the suite runs in CI on Linux,
+macOS and Windows, Python 3.9 through 3.13:
 
 ```console
 $ python3 tests/test_capacity.py
