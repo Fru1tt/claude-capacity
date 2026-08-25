@@ -8,6 +8,12 @@ sleep. It starts whether or not the quota can carry it. Launched with the week
 at 96%, it burns what is left, dies partway through, and the session you sit
 down to in the morning opens against a spent limit.
 
+Scheduling is the other half. A job that fires at 2am opens its five-hour
+window while you sleep, and that window has reset before you sit down — the
+night's work spends weekly quota, never the morning's five hours. What is
+missing is the go/no-go: something that knows, at 2am, whether the week can
+carry the job.
+
 This puts a guard in front of the job. It reads the quota numbers Claude Code
 already gives your status line, keeps them in a local file, and answers with an
 exit code — so the job below only starts when there is room:
