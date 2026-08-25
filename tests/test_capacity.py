@@ -993,6 +993,50 @@ if ledger.fcntl is not None:
     check("so the reader sees the 99 per cent, not a go on stale rows",
           ledger.reading(path=LOCK_LEDGER, now=NOW)["five_hour"]["pct"], 99)
 
+print("\n== a protected hour refuses the job that would still hold it ==")
+# --protect 08:00: wake to a five-hour window that is yours. A job started
+# inside the five hours before the protected time would still hold its window
+# when that time arrives, so the gate waits. Earlier than that, or once the
+# hour has passed, the ordinary rules decide. The clock used is the one `now`
+# carries, so these are deterministic on any machine in any timezone.
+PROTECT_LEDGER = SCRATCH / "protect.jsonl"
+NOW_P = datetime(2026, 8, 25, 2, 0, 0, tzinfo=timezone.utc)
+write([{"v": 1, "ts": iso(NOW_P), "five_hour_pct": 10.0,
+        "five_hour_reset": iso(NOW_P + timedelta(minutes=90)),
+        "seven_day_pct": 20.0,
+        "seven_day_reset": iso(NOW_P + timedelta(days=5))}],
+      path=PROTECT_LEDGER)
+
+
+def _protected_verdict(hour, minute):
+    return gate.capacity(path=PROTECT_LEDGER,
+                         now=NOW_P.replace(hour=hour, minute=minute),
+                         max_age_minutes=1440, protect=(8, 0))
+
+
+check("six hours ahead of the protected time, the job may run",
+      _protected_verdict(2, 0)["verdict"], gate.GO)
+check("four and a half hours ahead, its window would still be held at eight",
+      _protected_verdict(3, 30)["verdict"], gate.WAIT)
+check("and the reason says so in words",
+      "protected" in _protected_verdict(3, 30)["why"], True)
+check("one minute ahead is still a refusal",
+      _protected_verdict(7, 59)["verdict"], gate.WAIT)
+check("once the protected hour has passed, the ordinary rules decide",
+      _protected_verdict(9, 0)["verdict"], gate.GO)
+check("an empty ledger inside the protected span says WAIT, not UNKNOWN",
+      gate.capacity(path=SCRATCH / "no-such-protect.jsonl",
+                    now=NOW_P.replace(hour=5), protect=(8, 0))["verdict"],
+      gate.WAIT)
+try:
+    gate._protect_arg("nope")
+    refused = "accepted"
+except Exception as err:                                    # noqa: BLE001
+    refused = type(err).__name__
+check("a time that is not a time is refused loudly at the flag",
+      refused, "ArgumentTypeError")
+check("while a real one parses", gate._protect_arg("08:00"), (8, 0))
+
 # == the recorder trims the file it just grew past the cap ==
 # `compact` exists, but nothing schedules it: a ledger written by months of
 # renders grows until someone remembers a maintenance command. The recorder is

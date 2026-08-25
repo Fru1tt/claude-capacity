@@ -39,8 +39,9 @@ What that gets you:
 - You keep quota for yourself. Gate your jobs at 60% and they stop launching
   while 40% is still left for your own sessions — when you wake up, and for
   the rest of the week.
-- A job at 2am uses a five-hour window that has reset before you are awake,
-  so scheduled work costs weekly quota, not your morning.
+- Your morning five-hour window is defensible. `--protect 08:00` refuses any
+  job whose five-hour window would still be open at eight — so gated work can
+  run all night and you still sit down to a full window.
 - Anything that can read an exit code can use it: cron, a script, CI, an
   agent deciding on its own whether now is a good time to start.
 
@@ -74,6 +75,8 @@ will say so rather than invent a number.
 ```console
 $ python3 gate.py check --max-pct 80        # exit 0 to go, 1 to wait
 $ python3 gate.py check --max-context 70    # also wait on a full context window
+$ python3 gate.py check --protect 08:00     # never start what would hold the
+                                            # five-hour window at eight
 $ python3 gate.py check --json              # the full answer, for a script
 $ python3 gate.py show                      # where you stand
 $ python3 gate.py compact                   # trim by hand (it also trims itself)
@@ -82,7 +85,7 @@ $ python3 gate.py compact                   # trim by hand (it also trims itself
 In cron:
 
 ```cron
-0 2 * * * cd ~/claude-capacity && python3 gate.py check --quiet --max-age 1440 && ~/bin/nightly-agent
+0 2 * * * cd ~/claude-capacity && python3 gate.py check --quiet --max-age 1440 --protect 08:00 && ~/bin/nightly-agent
 ```
 
 That line gates at 80% — leaving `--max-pct` unstated means the default of 80,
@@ -107,6 +110,11 @@ same evening numbers as the first.
 
 **Use `check`, not `show`.** Only `check` puts the answer in its exit code.
 `show` always exits 0.
+
+**`--protect` outranks everything**, including not knowing: inside the five
+hours before a protected time the answer is wait, whatever the ledger says.
+The time is this machine's local clock, and on the one night a year the
+clocks change the boundary can be off by an hour.
 
 **The file looks after itself.** One row per status-line render, in a data
 directory `register` names — on a Mac,

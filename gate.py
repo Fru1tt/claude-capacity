@@ -25,13 +25,14 @@ last had a session open, and read the README section on the crontab line.
 import argparse
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import capture
 import ledger
 
 DEFAULT_MAX_PCT = 80.0
 DEFAULT_MAX_AGE_MINUTES = 30.0
+FIVE_HOUR_WINDOW_MINUTES = 300
 
 GO = "GO"
 WAIT = "WAIT"
@@ -79,24 +80,74 @@ def _age_words(age_minutes):
             "rather than guessing")
 
 
+def _protect_arg(text):
+    """The --protect value as an (hour, minute) pair, or a loud refusal.
+
+    A typo here must not silently unprotect the morning, so anything that is
+    not a time of day is an argument error, which argparse turns into exit 2
+    -- and under `&&` a 2 stops the job just as a 1 does.
+    """
+    parts = str(text).strip().split(":")
+    try:
+        if len(parts) != 2:
+            raise ValueError
+        hour, minute = int(parts[0]), int(parts[1])
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            raise ValueError
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            "%r is not a time of day; write it as HH:MM, e.g. 08:00" % text)
+    return (hour, minute)
+
+
+def _protect_why(protect, now):
+    """The reason to wait, or None: would a job started now still hold its
+    five-hour window when the protected wall-clock time arrives?
+
+    The protected time is read on the clock `now` carries -- from the command
+    line that is this machine's local time. The next occurrence is found at
+    `now`'s own UTC offset, so on the one night a year the clocks change the
+    boundary can be off by an hour; that is accepted rather than taking a
+    timezone database for one comparison.
+    """
+    hour, minute = protect
+    candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if candidate <= now:
+        candidate += timedelta(days=1)
+    if candidate - now <= timedelta(minutes=FIVE_HOUR_WINDOW_MINUTES):
+        return ("a job started now would still hold its five-hour window at "
+                "%02d:%02d, and that hour is protected" % (hour, minute))
+    return None
+
+
 def capacity(path=None, now=None, max_pct=DEFAULT_MAX_PCT,
-             max_age_minutes=DEFAULT_MAX_AGE_MINUTES, max_context_pct=None):
+             max_age_minutes=DEFAULT_MAX_AGE_MINUTES, max_context_pct=None,
+             protect=None):
     """The structured answer. Always a dict, never an exception.
 
     `verdict` is GO, WAIT or UNKNOWN. `why` says which rule decided it, in words
     a human reading a log will understand without opening this file.
     """
-    now = capture.aware(now) or datetime.now(timezone.utc)
+    now = capture.aware(now) or datetime.now(timezone.utc).astimezone()
     found = ledger.reading(path=path, now=now)
     out = {"verdict": UNKNOWN, "why": "", "checked_at": now.isoformat(),
            "windows": {}, "five_hour": None, "seven_day": None,
            "context_pct": None,
            "context_measured_at": None, "context_age_minutes": None,
            "cost_usd": None, "model_id": None, "health": None,
-           "max_pct": max_pct, "max_age_minutes": max_age_minutes}
+           "max_pct": max_pct, "max_age_minutes": max_age_minutes,
+           "protect": "%02d:%02d" % protect if protect else None}
+    # The protected hour outranks everything, including not knowing: a job
+    # refused for the morning's sake is refused whatever the ledger says.
+    protect_why = _protect_why(protect, now) if protect else None
     if not found:
-        out["why"] = ("the ledger holds no usable reading -- nothing has been "
-                      "captured, or every window in it has already reset")
+        if protect_why:
+            out["verdict"] = WAIT
+            out["why"] = protect_why
+        else:
+            out["why"] = ("the ledger holds no usable reading -- nothing has "
+                          "been captured, or every window in it has already "
+                          "reset")
         return out
 
     for key in ("context_pct", "context_measured_at", "context_age_minutes",
@@ -120,8 +171,17 @@ def capacity(path=None, now=None, max_pct=DEFAULT_MAX_PCT,
 
     live = [w for w in windows if windows[w]]
     if not live:
-        out["why"] = ("no window has a live reading -- every reset in the "
-                      "ledger has already passed")
+        if protect_why:
+            out["verdict"] = WAIT
+            out["why"] = protect_why
+        else:
+            out["why"] = ("no window has a live reading -- every reset in the "
+                          "ledger has already passed")
+        return out
+
+    if protect_why:
+        out["verdict"] = WAIT
+        out["why"] = protect_why
         return out
 
     stale = [w for w in live if _out_of_date(windows[w]["age_minutes"],
@@ -281,6 +341,10 @@ def main(argv=None):
     check.add_argument("--max-context", type=float, default=None,
                        dest="max_context",
                        help="also wait once the context window is this full")
+    check.add_argument("--protect", type=_protect_arg, default=None,
+                       metavar="HH:MM",
+                       help="wait if a job started now would still hold its "
+                            "five-hour window at this local time of day")
     check.add_argument("--allow-unknown", action="store_true",
                        help="exit 0 when capacity cannot be established")
     check.add_argument("--json", action="store_true", help="print the full answer")
@@ -319,7 +383,7 @@ def main(argv=None):
         return 0
 
     answer = capacity(max_pct=args.max_pct, max_age_minutes=args.max_age,
-                      max_context_pct=args.max_context)
+                      max_context_pct=args.max_context, protect=args.protect)
     if not args.quiet:
         if args.json:
             print(json.dumps(answer, indent=2, default=str))
