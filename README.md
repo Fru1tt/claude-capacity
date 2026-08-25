@@ -2,21 +2,10 @@
 
 Stop your Claude Code automation from launching into an empty tank.
 
-You run Claude Code on a subscription, and something scheduled runs without you
-— a nightly agent in cron, a long batch job, an automation working while you
-sleep. It starts whether or not the quota can carry it. Launched with the week
-at 96%, it burns what is left, dies partway through, and the session you sit
-down to in the morning opens against a spent limit.
-
-Scheduling is the other half. A job that fires at 2am opens its five-hour
-window while you sleep, and that window has reset before you sit down — the
-night's work spends weekly quota, never the morning's five hours. What is
-missing is the go/no-go: something that knows, at 2am, whether the week can
-carry the job.
-
-This puts a guard in front of the job. It reads the quota numbers Claude Code
-already gives your status line, keeps them in a local file, and answers with an
-exit code — so the job below only starts when there is room:
+Scheduled Claude Code work — a nightly agent, a cron job, anything running
+while you sleep — starts whether or not your subscription's quota can carry it.
+This is the go/no-go in front of it: it reads the quota numbers Claude Code
+already gives your status line, and answers with an exit code:
 
 ```console
 $ python3 gate.py check --max-pct 80 --quiet && ./run-the-overnight-job
@@ -33,6 +22,11 @@ WAIT -- seven-day-opus is at 96%, at or past the 80% limit; it resets in 5760 mi
   seven-day-sonnet  11.0%  resets in 5760 min  measured 0 min ago
   context           41.2%  measured 0 min ago
 ```
+
+That buys you two things. The dead hours become safe for heavy work: a 2am job
+runs only when the week has room, and its five-hour window has reset before you
+sit down — the night spends weekly quota, never your morning. And the cap is a
+budget: gate automation at 60% and it stops launching while 40% is still yours.
 
 Python 3.9 or later. No dependencies.
 
