@@ -612,11 +612,25 @@ def append(row, path=None):
         written = os.write(handle, line_bytes)
         # A short write leaves a torn row. It cannot be taken back, so it is
         # named here and counted by the reader rather than reported as success.
-        return "written" if written == len(line_bytes) else "short"
+        result = "written" if written == len(line_bytes) else "short"
     except OSError:
         return "failed"
     finally:
         _release(handle)
+    if result == "written":
+        # The write that leaves the file past the cap is the one that trims it,
+        # and only after its own lock is gone: `compact` takes the same lock,
+        # and two flocks in one thread wait on each other for ever. Imported
+        # here because `ledger` imports this module for that lock -- a
+        # top-level import back would be a cycle. And whatever goes wrong in
+        # there -- a broken ledger module included -- costs the trim alone:
+        # the row is already written, and this file may never raise.
+        try:
+            import ledger
+            ledger.compact(path=path)
+        except Exception:
+            pass
+    return result
 
 
 def _segment(row, key, label, fmt):

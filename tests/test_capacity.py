@@ -991,6 +991,49 @@ if ledger.fcntl is not None:
     check("so the reader sees the 99 per cent, not a go on stale rows",
           ledger.reading(path=LOCK_LEDGER, now=NOW)["five_hour"]["pct"], 99)
 
+# == the recorder trims the file it just grew past the cap ==
+# `compact` exists, but nothing schedules it: a ledger written by months of
+# renders grows until someone remembers a maintenance command. The recorder is
+# the one thing guaranteed to be running when the file is big, so the append
+# that lands past the cap is the one that trims -- after its own lock is gone,
+# because the trim takes the same lock and two of them in one thread would
+# wait on each other for ever.
+TRIM_LEDGER = SCRATCH / "trim.jsonl"
+filler = json.dumps({"seven_day_pct": 10.0, "noise": "x" * 60},
+                    separators=(",", ":")) + "\n"
+with open(TRIM_LEDGER, "w", encoding="utf-8") as out:
+    out.write(filler * (ledger.MAX_BYTES // len(filler) + 2))
+past = datetime.now().timestamp() - 3600
+os.utime(TRIM_LEDGER, (past, past))          # an old file is never throttled
+check("the ledger handed to the recorder is past the cap",
+      TRIM_LEDGER.stat().st_size > ledger.MAX_BYTES, True)
+check("the append that finds it there still reports written",
+      capture.append({"five_hour_pct": 55.0, "marker": "the-row-that-trimmed"},
+                     path=TRIM_LEDGER), "written")
+check("and leaves the file back under the cap",
+      TRIM_LEDGER.stat().st_size <= ledger.MAX_BYTES, True)
+check("with the row it just wrote as the newest survivor",
+      "the-row-that-trimmed" in
+      TRIM_LEDGER.read_text(encoding="utf-8").splitlines()[-1], True)
+
+# == a trim that cannot happen is a bigger file, not a dead status line ==
+# The recorder's first law is that it never raises. The trim runs inside it,
+# so a trim that blows up -- a broken ledger module, a disk that vanished
+# between the write and the stat -- must cost only the trim, never the row
+# that was already written and never the render.
+real_compact = ledger.compact
+def _exploding_compact(**kwargs):
+    raise OSError("disk gone")
+ledger.compact = _exploding_compact
+try:
+    try:
+        got = capture.append({"five_hour_pct": 66.0}, path=TRIM_LEDGER)
+    except Exception as err:
+        got = "raised: %r" % (err,)
+finally:
+    ledger.compact = real_compact
+check("a failing trim never reaches the caller", got, "written")
+
 shutil.rmtree(SCRATCH, ignore_errors=True)
 print("\n%s" % ("ALL PASS" if not FAILS else "%d FAILED: %s" % (len(FAILS), FAILS)))
 sys.exit(1 if FAILS else 0)
