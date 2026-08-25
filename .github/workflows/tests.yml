@@ -1,0 +1,28 @@
+# The whole suite, on every push, on every Python this claims to support and
+# every platform the code special-cases: Linux, macOS, and the Windows path
+# where fcntl does not exist.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+    runs-on: ${{ matrix.os }}
+    # The suite finishes in seconds. The one regression these tests cannot
+    # fail cleanly on is a lock ordering mistake, whose symptom on Linux and
+    # macOS is a hang -- so a hang must become a red run, not a six-hour wait.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python tests/test_capacity.py
