@@ -2,16 +2,19 @@
 
 [![tests](https://github.com/Fru1tt/claude-capacity/actions/workflows/tests.yml/badge.svg)](https://github.com/Fru1tt/claude-capacity/actions/workflows/tests.yml)
 
-Make your Claude Code automation quota-aware.
+Claude Code subscriptions have usage limits — a five-hour window and weekly
+ones. You can see them in the app. Your scripts and scheduled agents cannot,
+so an overnight job can start with the week nearly used up, burn what is
+left, and leave you nothing in the morning.
 
-A subscription is a set of tanks that refill on a schedule — five hours, a
-week, a week per model. You can see the gauges; the work you schedule cannot.
-So the 2am job launches into a spent week, burns what is left, and the session
-you sit down to in the morning opens against a dead limit.
+This tool is that missing check. It does two things:
 
-This is the gauge reader. It records the quota numbers Claude Code already
-gives your status line, and answers one question with an exit code — is there
-room to start?
+1. **Logs your usage.** A small hook in Claude Code's status line writes
+   every limit reading — percent used, when it resets — to a file on your
+   machine, automatically, while you work.
+2. **Answers one question before a job runs: is there enough left?** The
+   `check` command reads the newest numbers against a threshold you pick and
+   answers with its exit code — 0 run, 1 don't.
 
 ```console
 $ python3 gate.py check --max-pct 80 --quiet && ./run-the-overnight-job
@@ -29,20 +32,21 @@ WAIT -- seven-day-opus is at 96%, at or past the 80% limit; it resets in 5760 mi
   context           41.2%  measured 0 min ago
 ```
 
-Once your automation can read the gauges, quota stops being weather and
-becomes something you spend on purpose:
+What that gets you:
 
-- **Own the night.** A 2am job runs only when the week has room — and its
-  five-hour window has reset before you sit down. The night spends weekly
-  quota, never your morning.
-- **Give automation a budget.** Gate it at 60% and it stops launching while
-  40% is still yours.
-- **Put it in front of anything.** It is an exit code: cron, a queue worker,
-  a build step, any script that spends your quota unattended.
+- Overnight and scheduled agents only run when the week still has room for
+  them, and never find out halfway through that it didn't.
+- You keep quota for yourself. Gate your jobs at 60% and they stop launching
+  while 40% is still left for your own sessions — when you wake up, and for
+  the rest of the week.
+- A job at 2am uses a five-hour window that has reset before you are awake,
+  so scheduled work costs weekly quota, not your morning.
+- Anything that can read an exit code can use it: cron, a script, CI, an
+  agent deciding on its own whether now is a good time to start.
 
-Python 3.9 or later. No dependencies. And only the recorder knows about
-Claude — a second recorder writing the same shape of row, from any tool,
-is gated identically.
+Python 3.9 or later. No dependencies. Only the logging half is
+Claude-specific — anything that writes the same rows can be gated the same
+way.
 
 ## Install
 
