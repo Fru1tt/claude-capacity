@@ -20,7 +20,11 @@ Three properties this file has to keep, each preventing a specific failure:
    together, so two renders cannot both decide they are the one to write.
    EXCEPT ON WINDOWS, where `fcntl` does not exist and there is no advisory lock
    to take. The write itself is still atomic there, so lines do not tear; what
-   is lost is only that pairing, and its cost is a duplicate row.
+   is lost is the pairing, at the cost of a duplicate row, and the append-during-
+   compaction guarantee: with no lock to queue on, a row landing in the seconds
+   a trim is rewriting the file can be replaced away. The next render re-records
+   within a minute, and a trim happens once per months, so the cost is a short
+   gap in a Windows ledger written by several sessions at once.
 
 What the payload does and does not carry, both halves checked 2026-08-23:
 
