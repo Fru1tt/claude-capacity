@@ -1,6 +1,12 @@
 # claude-capacity
 
 [![tests](https://github.com/Fru1tt/claude-capacity/actions/workflows/tests.yml/badge.svg)](https://github.com/Fru1tt/claude-capacity/actions/workflows/tests.yml)
+![python](https://img.shields.io/badge/python-3.9%2B-blue)
+![license](https://img.shields.io/badge/license-MIT-green)
+![dependencies](https://img.shields.io/badge/dependencies-none-lightgrey)
+
+**Quota-aware gating for Claude Code that runs without you — autonomous
+agents, cron jobs, overnight work.**
 
 Claude Code subscriptions have usage limits — a five-hour window and weekly
 ones. You can see them in the app. Your scripts and scheduled agents cannot,
