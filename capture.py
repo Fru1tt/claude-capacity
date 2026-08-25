@@ -177,14 +177,16 @@ def _pct(value):
 def _local_iso(moment, now):
     """An instant as a local-offset ISO string, or None if it is unusable.
 
-    Two ways it is unusable, and both are reached by real payloads. `astimezone`
-    raises OverflowError on a stamp within one UTC offset of the year 1 or the
-    year 9999, so it is guarded rather than left to escape a module that may
-    never raise. And a reset further ahead than any real window is refused: see
-    MAX_RESET_AHEAD_DAYS.
+    A reset further from now than any real window, in EITHER direction, is
+    refused by arithmetic rather than left to `astimezone` to reject. It does
+    raise on stamps within one UTC offset of the year 1 or the year 9999 --
+    but only on platforms and zones where the conversion happens to blow up:
+    this machine's C library refuses prehistoric dates and the UTC runners'
+    accept them, so a sentinel stamp was refused here and rendered as "00:00"
+    there. The exception guard stays, as a net, not as the rule.
     """
     try:
-        if moment > now + timedelta(days=MAX_RESET_AHEAD_DAYS):
+        if abs(moment - now) > timedelta(days=MAX_RESET_AHEAD_DAYS):
             return None
         return moment.astimezone().isoformat(timespec="seconds")
     except (OSError, OverflowError, ValueError):
