@@ -13,10 +13,12 @@ Exit 0 to go, 1 to wait. Without `--quiet` it says why:
 
 ```console
 $ python3 gate.py check --max-pct 80
-GO -- every live window is under 80%: five-hour at 32%, seven-day at 72%
-  five-hour   32.0%  resets in 120 min  measured 0 min ago
-  seven-day   72.0%  resets in 4320 min  measured 0 min ago
-  context     41.2%  measured 0 min ago
+WAIT -- seven-day-opus is at 96%, at or past the 80% limit; it resets in 5760 minutes
+  five-hour         32.5%  resets in 180 min  measured 0 min ago
+  seven-day         72.0%  resets in 5760 min  measured 0 min ago
+  seven-day-opus    96.2%  resets in 5760 min  measured 0 min ago
+  seven-day-sonnet  11.0%  resets in 5760 min  measured 0 min ago
+  context           41.2%  measured 0 min ago
 ```
 
 Python 3.9 or later. No dependencies.
@@ -67,9 +69,18 @@ skip the job every night. `1440` accepts a reading up to a day old.
 **Use `check`, not `show`.** Only `check` puts the answer in its exit code.
 `show` always exits 0.
 
-**It knows two windows.** Five-hour and seven-day, because those are the two
-Claude Code documents. If a third ever appears this won't see it, and would then
-report room that might not exist.
+**It reads every window Claude Code sends**, not a fixed list. The docs describe
+two — the five-hour session and the all-models week — but recent builds also send
+per-model weekly windows such as `seven_day_opus` and `seven_day_sonnet`. Those
+are checked too, and a new one starts working the day it appears, with no change
+here. A window that is nearly spent can never be silently skipped.
+
+**But some limits are not in the payload at all.** If your usage screen shows a
+per-model weekly bar that Claude Code does not send — a Fable weekly limit, as of
+today — then nothing running on your machine can see it, including this. Anthropic
+tracks it internally; it just isn't in the data a status line receives. That is
+[an open request](https://github.com/anthropics/claude-code/issues/88137), so
+check whether it is still true when you read this.
 
 **No overage or provider status.** The status line payload doesn't carry them —
 just a percentage and a reset time per window. Those fields exist, but on a

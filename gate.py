@@ -89,7 +89,8 @@ def capacity(path=None, now=None, max_pct=DEFAULT_MAX_PCT,
     now = capture.aware(now) or datetime.now(timezone.utc)
     found = ledger.reading(path=path, now=now)
     out = {"verdict": UNKNOWN, "why": "", "checked_at": now.isoformat(),
-           "five_hour": None, "seven_day": None, "context_pct": None,
+           "windows": {}, "five_hour": None, "seven_day": None,
+           "context_pct": None,
            "context_measured_at": None, "context_age_minutes": None,
            "cost_usd": None, "model_id": None, "health": None,
            "max_pct": max_pct, "max_age_minutes": max_age_minutes}
@@ -101,52 +102,61 @@ def capacity(path=None, now=None, max_pct=DEFAULT_MAX_PCT,
     for key in ("context_pct", "context_measured_at", "context_age_minutes",
                 "cost_usd", "model_id", "health"):
         out[key] = found.get(key)
-    for window in ledger.WINDOWS:
-        got = found.get(window)
+    # EVERY window the ledger found, whatever it is called. The gate used to
+    # walk a two-name tuple, so a per-model weekly window at 96% was not merely
+    # unreported -- it was not checked, and this said GO.
+    windows = {}
+    for window, got in (found.get("windows") or {}).items():
         if not got:
+            windows[window] = None
             continue
-        out[window] = dict(got)
-        out[window]["minutes_until_reset"] = _minutes_until(got["reset"], now)
+        windows[window] = dict(got)
+        windows[window]["minutes_until_reset"] = _minutes_until(got["reset"], now)
+    out["windows"] = windows
+    # The same two keys as ever, pointing at the same objects. `windows` is what
+    # says which windows exist; these two say where the familiar pair are.
+    for window in capture.DOCUMENTED_WINDOWS:
+        out[window] = windows.get(window)
 
-    live = [w for w in ledger.WINDOWS if out[w]]
+    live = [w for w in windows if windows[w]]
     if not live:
         out["why"] = ("no window has a live reading -- every reset in the "
                       "ledger has already passed")
         return out
 
-    stale = [w for w in live if _out_of_date(out[w]["age_minutes"],
+    stale = [w for w in live if _out_of_date(windows[w]["age_minutes"],
                                              max_age_minutes)]
     if stale:
         # Name the window and its own age. The earlier wording called this "the
-        # newest reading", which was false whenever the two windows were not
-        # equally stale: with a five-hour reading 40 minutes old beside a
-        # seven-day one 400 minutes old, it announced that the newest reading
-        # was 400 minutes old. This line is read in a log at 3am by someone
-        # working out why nothing ran, so it says which window is out of date.
-        # Ranked on the SIZE of the error, not its sign, now that a reading can
-        # be out of true in either direction.
-        window = max(stale, key=lambda w: abs(out[w]["age_minutes"]))
-        said, because = _age_words(out[window]["age_minutes"])
+        # newest reading", which was false whenever the windows were not equally
+        # stale: with a five-hour reading 40 minutes old beside a seven-day one
+        # 400 minutes old, it announced that the newest reading was 400 minutes
+        # old. This line is read in a log at 3am by someone working out why
+        # nothing ran, so it says which window is out of date. Ranked on the
+        # SIZE of the error, not its sign, now that a reading can be out of true
+        # in either direction.
+        window = max(stale, key=lambda w: abs(windows[w]["age_minutes"]))
+        said, because = _age_words(windows[window]["age_minutes"])
         out["why"] = ("the %s reading is %s, further out than the %.0f minutes "
                       "allowed -- %s"
                       % (window.replace("_", "-"), said, max_age_minutes,
                          because))
         return out
 
-    over = [w for w in live if out[w]["pct"] >= max_pct]
+    over = [w for w in live if windows[w]["pct"] >= max_pct]
     if over:
-        window = max(over, key=lambda w: out[w]["pct"])
+        window = max(over, key=lambda w: windows[w]["pct"])
         out["verdict"] = WAIT
-        minutes = out[window]["minutes_until_reset"]
+        minutes = windows[window]["minutes_until_reset"]
         out["why"] = ("%s is at %.0f%%, at or past the %.0f%% limit%s"
-                      % (window.replace("_", "-"), out[window]["pct"], max_pct,
-                         "" if minutes is None
+                      % (window.replace("_", "-"), windows[window]["pct"],
+                         max_pct, "" if minutes is None
                          else "; it resets in %.0f minutes" % minutes))
         return out
 
     if max_context_pct is not None and out["context_pct"] is not None:
-        # THE SAME FRESHNESS RULE AS THE TWO WINDOWS, applied here because this
-        # number decides too. It used to be applied at any age at all: the
+        # THE SAME FRESHNESS RULE AS THE QUOTA WINDOWS, applied here because
+        # this number decides too. It used to be applied at any age at all: the
         # staleness check above covered the quota windows only, and the context
         # reading carried no measurement time, so nothing could have checked it
         # and nothing reported it. A context percentage and a window percentage
@@ -175,37 +185,50 @@ def capacity(path=None, now=None, max_pct=DEFAULT_MAX_PCT,
             return out
 
     out["verdict"] = GO
+    # Every live window by name, not a count and not a fixed pair -- so a GO can
+    # be read afterwards as a statement about what was actually checked.
     out["why"] = ("every live window is under %.0f%%: %s" % (
-        max_pct, ", ".join("%s at %.0f%%" % (w.replace("_", "-"), out[w]["pct"])
+        max_pct, ", ".join("%s at %.0f%%"
+                           % (w.replace("_", "-"), windows[w]["pct"])
                            for w in live)))
     return out
 
 
 def _human(answer):
     lines = ["%s -- %s" % (answer["verdict"], answer["why"])]
-    for window in ledger.WINDOWS:
-        got = answer.get(window)
+    windows = answer.get("windows") or {}
+    # One column wide enough for the longest name present, and never narrower
+    # than the ten characters the two documented windows have always used, so a
+    # payload sending only those two prints exactly as it always did.
+    width = max([10] + [len(w) for w in windows])
+    for window, got in windows.items():
         if not got:
-            lines.append("  %-10s no live reading" % window.replace("_", "-"))
+            lines.append("  %-*s no live reading"
+                         % (width, window.replace("_", "-")))
             continue
         minutes = got.get("minutes_until_reset")
-        lines.append("  %-10s %5.1f%%  resets in %s  measured %.0f min ago"
-                     % (window.replace("_", "-"), got["pct"],
+        lines.append("  %-*s %5.1f%%  resets in %s  measured %.0f min ago"
+                     % (width, window.replace("_", "-"), got["pct"],
                         "unknown" if minutes is None else "%.0f min" % minutes,
                         got["age_minutes"]))
     if answer.get("context_pct") is not None:
         # With its age, which is the whole point of recording one: a context
         # number printed bare cannot be told apart from yesterday's.
         age = answer.get("context_age_minutes")
-        lines.append("  %-10s %5.1f%%%s"
-                     % ("context", answer["context_pct"],
+        lines.append("  %-*s %5.1f%%%s"
+                     % (width, "context", answer["context_pct"],
                         "" if age is None else
                         "  measured %.0f min ago" % age if age >= 0 else
                         "  stamped %.0f min ahead" % abs(age)))
     health = answer.get("health") or {}
     if health.get("unreadable"):
-        lines.append("  %-10s %d unreadable row(s) skipped"
-                     % ("ledger", health["unreadable"]))
+        lines.append("  %-*s %d unreadable row(s) skipped"
+                     % (width, "ledger", health["unreadable"]))
+    if health.get("windows_ignored"):
+        # Never silent: the count exists so that hitting the cap is visible
+        # here, rather than being a window that quietly stopped being checked.
+        lines.append("  %-*s %d window name(s) past the cap, not checked"
+                     % (width, "ledger", health["windows_ignored"]))
     return "\n".join(lines)
 
 
@@ -249,8 +272,8 @@ def main(argv=None):
 
     check = subs.add_parser("check", help="exit 0 to go, 1 to wait")
     check.add_argument("--max-pct", type=float, default=DEFAULT_MAX_PCT,
-                       help="wait once either window is at this per cent "
-                            "(default: %(default)s)")
+                       help="wait once ANY window the payload sends is at this "
+                            "per cent (default: %(default)s)")
     check.add_argument("--max-age", type=float, default=DEFAULT_MAX_AGE_MINUTES,
                        dest="max_age",
                        help="treat a reading older than this many minutes as "

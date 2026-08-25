@@ -4,9 +4,9 @@
 Claude Code runs a status-line command on every render and hands it a JSON
 object on stdin. Short of scraping an OAuth credential out of the keychain and
 calling an undocumented usage endpoint, that object is the only place a local
-process can see how much of the five-hour and seven-day windows has been spent,
-and how full the current context window is. This module reads one of those
-payloads, writes one row, and returns one short string to show.
+process can see how much of each quota window has been spent, and how full the
+current context window is. This module reads one of those payloads, writes one
+row, and returns one short string to show.
 
 Three properties this file has to keep, each preventing a specific failure:
 
@@ -37,9 +37,16 @@ What the payload does and does not carry, both halves checked 2026-08-23:
 Any tool claiming to read a provider status from here is reading something it
 was not given.
 
-Only two windows are known here, because only two are documented. If a third is
-ever added, this records the two it understands and says nothing about the rest
--- see WINDOWS in `ledger`, which is where that limit bites.
+HOW MANY WINDOWS THERE ARE IS NOT DECIDED HERE, AND WAS NEVER SAFE TO GUESS.
+The documentation lists two, `five_hour` and `seven_day`. Claude Code 2.1.237
+sends four: those two plus `seven_day_opus` and `seven_day_sonnet`, undocumented
+per-model weekly windows already arriving at status lines
+(github.com/anthropics/claude-code/issues/88137, filed 2026-08-20). This module
+used to look up the two names it knew and drop everything else, which fails in
+the one direction that costs money -- an ignored window that is nearly spent
+reads downstream as a window with room, and the gate says go into a wall. So
+every key under `rate_limits` is read, under whatever name the payload gave it,
+subject only to the sanitising in `_window_name` and the count cap MAX_WINDOWS.
 """
 
 import json
@@ -66,9 +73,42 @@ MODEL_ID_MAX = 64
 # 80 lines, 0 torn. The cap is belt to that braces: it bounds how much a single
 # short write could leave behind, and it keeps the ledger's rows a predictable
 # size. A row too long sheds these fields, in this order, rather than being
-# dropped whole -- the quota numbers are the point of the row and are never shed.
+# dropped whole.
+#
+# THE QUOTA WINDOWS ARE NOT IN THIS LIST BECAUSE THEY SHED LAST, after every
+# field named here. Only once nothing else is left does `_shed` start on the
+# windows, and it takes the LEAST-USED first: the fullest window is the one that
+# decides admission, so it is the last number in the row worth losing. A window
+# goes as a pair, its percentage and its reset together, because the reader
+# needs both and half of one is bytes spent on nothing.
 MAX_ROW_BYTES = 512
 SHED_ORDER = ("cost_usd", "context_size", "model_id", "context_pct")
+
+# The two windows Claude Code documents. Nothing is filtered on this -- the
+# payload decides what windows exist -- it fixes the ORDER things are listed in,
+# so the pair every reader recognises comes first in a row, a status line and a
+# verdict alike, and it names the two keys older ledgers and older callers
+# already depend on.
+DOCUMENTED_WINDOWS = ("five_hour", "seven_day")
+
+# Short label and reset format for the status line, for the documented two. A
+# window outside this table is still shown; see `_label`.
+WINDOW_LABELS = {"five_hour": ("5h", " %H:%M"), "seven_day": ("7d", " %a")}
+
+# How many windows one row may carry. Documented: two. Observed in Claude Code
+# 2.1.237: four. Eight is twice what has actually been seen, which leaves room
+# for a per-model window for every model family shipping at once while still
+# bounding what an arbitrary payload can make this write and store. Past the cap
+# the HIGHEST percentages are the ones kept, for the same reason the shed keeps
+# them last: the fullest window is the one that decides admission.
+MAX_WINDOWS = 8
+
+# A window name arrives from someone else's JSON and leaves as a key in ours, so
+# it is bounded and filtered. 32 characters is twice the longest real name
+# (`seven_day_sonnet`, 16).
+WINDOW_NAME_MAX = 32
+_NAME_CHARS = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
 
 # The longest window Claude Code documents is seven days. A reset beyond this is
 # not a long window, it is a broken field -- and a broken one that lasts, because
@@ -184,14 +224,120 @@ def _reset(value, now=None):
     return None
 
 
-def _window(payload, name, now=None):
+def _window_name(name):
+    """A payload's own key as a row key, or None if it does not qualify.
+
+    THIS IS UNTRUSTED INPUT BECOMING A JSON KEY, and it is the one place in the
+    tool where that happens. A key from someone else's payload can be any string
+    JSON allows: a megabyte long, full of quotes and control characters, or
+    chosen to collide with a field this row already uses. So it is filtered
+    rather than trusted, and a name that does not qualify is skipped entirely --
+    no cleaning up, no truncating, because a name this tool invented would then
+    be recorded as if the payload had sent it.
+
+    The rules, each refusing a specific way it could go wrong:
+
+    - Letters, digits and underscore only, and no leading or trailing
+      underscore. Deliberately wider than the lowercase Claude Code actually
+      sends: skipping a window is the expensive direction, so the set says no
+      only to characters that have no business in a key at all.
+    - At most WINDOW_NAME_MAX characters, so one payload cannot decide how big a
+      row is.
+    - Not `context`, which would produce `context_pct` -- a key the reader
+      already gives different treatment, because the session's context window
+      has no reset and is not a quota. Two unrelated numbers under one name is
+      worse than one missing one.
+    - Nothing ending `_pct` or `_reset`, which would produce `x_pct_pct` and
+      leave the reader's own naming rule reading two windows out of one.
+    """
+    if not isinstance(name, str) or not name or len(name) > WINDOW_NAME_MAX:
+        return None
+    if not _NAME_CHARS.issuperset(name):
+        return None
+    if name.startswith("_") or name.endswith("_"):
+        return None
+    if name == "context" or name.endswith("_pct") or name.endswith("_reset"):
+        return None
+    return name
+
+
+def _windows(payload, now=None):
+    """Every quota window the payload carries: a list of (name, pct, reset).
+
+    THE PAYLOAD DECIDES WHICH WINDOWS EXIST, not this file. Nothing here looks
+    up a name it already knew, so `seven_day_opus` and anything else added later
+    is recorded the day it starts arriving rather than the day someone notices.
+
+    A window needs a usable percentage to be worth a row at all -- the reader
+    cannot use a reset without one, so a reset on its own is bytes in a bounded
+    row buying nothing. An unusable RESET is kept, because the percentage still
+    says how full the window is even when nobody can say when it turns over.
+    """
     limits = payload.get("rate_limits")
     if not isinstance(limits, dict):
-        return None, None
-    window = limits.get(name)
-    if not isinstance(window, dict):
-        return None, None
-    return _pct(window.get("used_percentage")), _reset(window.get("resets_at"), now)
+        return []
+    found = []
+    for raw, window in limits.items():
+        name = _window_name(raw)
+        if name is None or not isinstance(window, dict):
+            continue
+        pct = _pct(window.get("used_percentage"))
+        if pct is None:
+            continue
+        found.append((name, pct, _reset(window.get("resets_at"), now)))
+    if len(found) > MAX_WINDOWS:
+        # Over the cap, keep the fullest -- and keep them in the payload's own
+        # order, so a row's keys do not shuffle as percentages move.
+        ranked = sorted(range(len(found)), key=lambda i: (-found[i][1], i))
+        keep = set(ranked[:MAX_WINDOWS])
+        found = [w for i, w in enumerate(found) if i in keep]
+    return found
+
+
+def _pct_keys(row):
+    """Every key in a row that holds a window's percentage.
+
+    Raw and unfiltered, because this decides what can be SHED and what counts as
+    movement -- and for both of those, a key that got into the row by some route
+    this file did not take still has to be reachable.
+    """
+    return [key for key in row
+            if key.endswith("_pct") and key != "context_pct"]
+
+
+def order_windows(names):
+    """The documented pair first, then the rest by name.
+
+    One ordering rule, used by the row, the status line and the gate's verdict,
+    so a reader who learns the order once has learnt it everywhere.
+    """
+    names = set(names)
+    return [n for n in DOCUMENTED_WINDOWS if n in names] \
+        + sorted(names.difference(DOCUMENTED_WINDOWS))
+
+
+def _named_windows(row):
+    """The windows a row carries, in no particular order.
+
+    A LEDGER IS AN INGEST SURFACE, so the same filter that guards a payload key
+    on the way in guards a row key on the way out: a hand-edited ledger cannot
+    put a megabyte-long window name into a gate's output either.
+    """
+    return [key[:-4] for key in _pct_keys(row)
+            if _window_name(key[:-4]) is not None]
+
+
+def window_names(row):
+    """The windows a row carries, named and ordered.
+
+    `ledger` reads thousands of rows a call and orders its answer once at the
+    end, so its loop takes `_named_windows` instead. Measured 2026-08-25, a
+    4,000-row ledger carrying two windows a row, median of nine reads: 77.5 ms
+    ordering every row against 73.7 ms ordering once. That difference is small
+    and is not the reason -- ordering four thousand rows to print one list is
+    simply the wrong shape, and the milliseconds only confirm it.
+    """
+    return order_windows(_named_windows(row))
 
 
 def _context(payload):
@@ -235,29 +381,69 @@ def build_row(payload, now=None):
     A payload that is not an object is read as an EMPTY one, which yields a row
     carrying only its schema and its stamp. `render` already refuses a non-dict
     before it gets here, but this function is public and the readers below it
-    (`_window`, `_context`, `_cost`, `_model`) each guard their own slice of the
+    (`_windows`, `_context`, `_cost`, `_model`) each guard their own slice of the
     payload -- so reaching into it with `.get` on the way in was the one
     unguarded step, and it turned `build_row(7)` into an AttributeError out of a
     module whose first property is that it may never raise.
+
+    The window keys are the payload's own names with `_pct` and `_reset` on the
+    end, which is why `five_hour` and `seven_day` still land exactly where they
+    always did and every ledger written before this reads unchanged.
     """
     if not isinstance(payload, dict):
         payload = {}
     now = aware(now) or datetime.now(timezone.utc).astimezone()
-    five_pct, five_reset = _window(payload, "five_hour", now)
-    week_pct, week_reset = _window(payload, "seven_day", now)
-    ctx_pct, ctx_size = _context(payload)
     row = {"v": SCHEMA, "ts": now.isoformat(timespec="seconds")}
-    for key, value in (("five_hour_pct", five_pct),
-                       ("five_hour_reset", five_reset),
-                       ("seven_day_pct", week_pct),
-                       ("seven_day_reset", week_reset),
-                       ("context_pct", ctx_pct),
+    for name, pct, reset in _windows(payload, now):
+        row[name + "_pct"] = pct
+        if reset is not None:
+            row[name + "_reset"] = reset
+    ctx_pct, ctx_size = _context(payload)
+    for key, value in (("context_pct", ctx_pct),
                        ("context_size", ctx_size),
                        ("cost_usd", _cost(payload)),
                        ("model_id", _model(payload))):
         if value is not None:
             row[key] = value
     return row
+
+
+def _shed(row):
+    """Drop the one field a too-long row can most afford to lose. True if it did.
+
+    THE ORDER IS THE WHOLE POINT, and it runs from what a reader can live
+    without to what decides whether work may start:
+
+    1. SHED_ORDER -- cost, context size, model id, context percentage.
+    2. A reset with no percentage beside it. The reader needs both, so such a
+       key is already dead weight and goes before any live window.
+    3. The windows, LEAST-USED FIRST. A window at 4% says there is room, which
+       is a thing the gate can find out again from any other row; a window at
+       96% is the one that holds the work back, and losing it is the failure
+       this tool exists to prevent. So the fullest window is the last number in
+       the row to go. A percentage that will not parse sorts below every real
+       one -- it can decide nothing, so it is the first of the windows worth
+       losing -- and the name breaks ties, so two rows carrying the same numbers
+       always shed the same field.
+    """
+    for key in SHED_ORDER:
+        if key in row:
+            del row[key]
+            return True
+    for key in sorted(row):
+        if key.endswith("_reset") and (key[:-6] + "_pct") not in row:
+            del row[key]
+            return True
+    ranked = []
+    for key in _pct_keys(row):
+        pct = _pct(row[key])
+        ranked.append((-1.0 if pct is None else pct, key[:-4]))
+    if not ranked:
+        return False
+    name = min(ranked)[1]
+    for key in (name + "_pct", name + "_reset"):
+        row.pop(key, None)
+    return True
 
 
 def _encode(row):
@@ -271,11 +457,7 @@ def _encode(row):
         line_bytes = (text + "\n").encode("utf-8")
         if len(line_bytes) < MAX_ROW_BYTES:
             return line_bytes
-        for key in SHED_ORDER:
-            if key in row:
-                del row[key]
-                break
-        else:
+        if not _shed(row):
             return None
 
 
@@ -301,7 +483,16 @@ def _last_row(path):
 
 
 def _moved(previous, current):
-    for field in ("five_hour_pct", "seven_day_pct"):
+    """Has any quota percentage moved by a point or more since the last row?
+
+    EVERY window, not a fixed pair: a per-model weekly allowance that jumps
+    while the two documented windows sit still is real movement, and throttling
+    it away would hide exactly the number this tool was extended to see.
+
+    The context percentage is deliberately not one of these. It climbs on every
+    single message, so counting it would mean nothing was ever throttled.
+    """
+    for field in _pct_keys(current):
         old, new = _pct(previous.get(field)), _pct(current.get(field))
         if old is not None and new is not None and abs(new - old) >= 1:
             return True
@@ -443,7 +634,7 @@ def _segment(row, key, label, fmt):
     except TypeError:
         return None
     stamp = row.get(key + "_reset")
-    if stamp:
+    if stamp and fmt:
         try:
             segment += datetime.fromisoformat(stamp).strftime(fmt)
         except (TypeError, ValueError):
@@ -451,18 +642,42 @@ def _segment(row, key, label, fmt):
     return segment
 
 
+def _label(name):
+    """A window's short name for the status line.
+
+    The documented two keep the labels they have always had. Anything else is
+    shown under a name derived from its own: a window whose name extends a
+    documented one -- `seven_day_opus` -- borrows that window's short label and
+    keeps the rest, giving "7d opus", which is both short enough for a status
+    line and unmistakably a different number from "7d". A name resembling
+    nothing known is printed as it arrived, with its underscores opened out.
+    """
+    for prefix, (short, _fmt) in WINDOW_LABELS.items():
+        if name == prefix:
+            return short
+        if name.startswith(prefix + "_"):
+            return short + " " + name[len(prefix) + 1:].replace("_", " ")
+    return name.replace("_", " ")
+
+
 def line(row):
     """The one glanceable string, built from the row that was recorded, so what
-    is shown and what is stored cannot drift apart."""
+    is shown and what is stored cannot drift apart.
+
+    EVERY window in the row is shown. A window the line leaves out is a number
+    nobody looks at, which is the whole failure this tool exists to prevent --
+    so the line grows by a few characters rather than choosing for the reader.
+    Only the documented two carry a reset in the line; the rest are a percentage
+    alone, which keeps the string short, and `gate show` has the reset times.
+    """
     if not isinstance(row, dict):
         return FALLBACK
     parts = []
-    for key, label, fmt in (("five_hour", "5h", " %H:%M"),
-                            ("seven_day", "7d", " %a")):
-        if key + "_pct" in row:
-            segment = _segment(row, key, label, fmt)
-            if segment is not None:
-                parts.append(segment)
+    for name in window_names(row):
+        _short, fmt = WINDOW_LABELS.get(name, (None, ""))
+        segment = _segment(row, name, _label(name), fmt)
+        if segment is not None:
+            parts.append(segment)
     if "context_pct" in row:
         try:
             parts.append("ctx %d%%" % round(row["context_pct"]))
@@ -489,7 +704,10 @@ def render(raw, path=None):
         return FALLBACK
     row = build_row(payload)
     text = line(row)
-    if any(key in row for key in ("five_hour_pct", "seven_day_pct", "context_pct")):
+    # Any percentage at all is worth a row, which is not the same test as "one
+    # of the two windows I know". A payload carrying only per-model windows was
+    # a payload this recorded nothing for.
+    if any(key.endswith("_pct") for key in row):
         append(row, path)
     return text
 

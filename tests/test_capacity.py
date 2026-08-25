@@ -48,7 +48,8 @@ def iso(moment):
 
 
 def payload(five=None, week=None, five_reset=None, week_reset=None,
-            context=None, size=200000, cost=None, model="claude-opus-5"):
+            context=None, size=200000, cost=None, model="claude-opus-5",
+            windows=None):
     body = {}
     limits = {}
     if five is not None:
@@ -57,6 +58,12 @@ def payload(five=None, week=None, five_reset=None, week_reset=None,
     if week is not None:
         limits["seven_day"] = {"used_percentage": week,
                                "resets_at": week_reset}
+    # Anything else the payload carries, named by whoever sent it: `windows` is
+    # {name: (percentage, reset)}, and a value that is not a pair is passed
+    # through untouched so a test can send a window that is not an object.
+    for name, sent in (windows or {}).items():
+        limits[name] = ({"used_percentage": sent[0], "resets_at": sent[1]}
+                        if isinstance(sent, tuple) else sent)
     if limits:
         body["rate_limits"] = limits
     if context is not None:
@@ -427,6 +434,241 @@ write([{"v": 1, "ts": iso(NOW - timedelta(minutes=2)),
 answer = gate.capacity(path=LEDGER, now=NOW, max_pct=80, max_context_pct=50)
 check("a full context window can hold work back when asked to",
       answer["verdict"], gate.WAIT)
+
+print("\n== every window the payload sends, not the two that are documented ==")
+# Claude Code 2.1.237 sends FOUR windows -- five_hour, seven_day,
+# seven_day_opus and seven_day_sonnet -- while the status-line documentation
+# lists two (github.com/anthropics/claude-code/issues/88137, filed 2026-08-20).
+# A window this tool does not read is a window it cannot gate on, and the
+# direction that fails is the expensive one: the weekly Opus allowance is nearly
+# spent, both documented windows have room, and the gate says GO into a wall.
+four = capture.build_row(json.loads(payload(
+    five=32, week=40, five_reset=epoch, week_reset=epoch,
+    windows={"seven_day_opus": (96, epoch),
+             "seven_day_sonnet": (12, epoch)})), now=NOW)
+check("all four windows are recorded, under the payload's own names",
+      sorted(k for k in four if k.endswith("_pct")),
+      ["five_hour_pct", "seven_day_opus_pct", "seven_day_pct",
+       "seven_day_sonnet_pct"])
+check("and each one keeps its reset beside it",
+      sorted(k for k in four if k.endswith("_reset")),
+      ["five_hour_reset", "seven_day_opus_reset", "seven_day_reset",
+       "seven_day_sonnet_reset"])
+write([{"v": 1, "ts": iso(NOW - timedelta(minutes=2)),
+        "five_hour_pct": 32, "five_hour_reset": iso(soon),
+        "seven_day_pct": 40, "seven_day_reset": iso(later),
+        "seven_day_opus_pct": 96, "seven_day_opus_reset": iso(later),
+        "seven_day_sonnet_pct": 12, "seven_day_sonnet_reset": iso(later)}])
+answer = gate.capacity(path=LEDGER, now=NOW, max_pct=80)
+check("a nearly-spent per-model window holds the work back",
+      answer["verdict"], gate.WAIT)
+check("and the verdict names the window that decided it",
+      "seven-day-opus" in answer["why"], True)
+check("the answer lists every window found, not a fixed pair",
+      sorted(answer["windows"]),
+      ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"])
+check("and so does the printed form",
+      all(name in gate._human(answer)
+          for name in ("five-hour", "seven-day-opus", "seven-day-sonnet")),
+      True)
+check("the documented two still answer under their old keys as well",
+      (answer["five_hour"]["pct"], answer["seven_day"]["pct"]), (32, 40))
+check("and those keys cannot drift, being the very same objects",
+      answer["five_hour"] is answer["windows"]["five_hour"], True)
+found = ledger.reading(path=LEDGER, now=NOW)
+check("the reading lists them too", sorted(found["windows"]),
+      ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"])
+check("the documented pair is listed first, then the rest by name",
+      list(found["windows"]),
+      ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"])
+check("a GO names every live window it checked",
+      sorted(w for w in ("five-hour", "seven-day", "seven-day-opus",
+                         "seven-day-sonnet")
+             if w in gate.capacity(path=LEDGER, now=NOW, max_pct=99)["why"]),
+      ["five-hour", "seven-day", "seven-day-opus", "seven-day-sonnet"])
+# Asserted on a row with resets written out in full rather than on `four`,
+# whose resets are rendered in whatever zone the machine running this is in.
+check("and the status line shows all four rather than choosing for you",
+      capture.line({"five_hour_pct": 32, "five_hour_reset": iso(NOW),
+                    "seven_day_pct": 40, "seven_day_reset": iso(NOW),
+                    "seven_day_opus_pct": 96, "seven_day_sonnet_pct": 12,
+                    "context_pct": 41}),
+      "5h 32% 12:00  7d 40% Sun  7d opus 96%  7d sonnet 12%  ctx 41%")
+# A payload with no documented window at all: the whole row used to be thrown
+# away, because the decision to append tested for the two names it knew.
+LEDGER.unlink(missing_ok=True)
+only_opus = capture.render(payload(windows={"seven_day_opus": (91, epoch)}),
+                           path=LEDGER)
+check("a payload carrying only per-model windows is still recorded",
+      json.loads(LEDGER.read_text().splitlines()[-1])["seven_day_opus_pct"], 91)
+check("and still shown", only_opus, "7d opus 91%")
+
+print("\n== a ledger written before per-model windows existed ==")
+# Written by hand exactly as the old capture wrote it -- the point of the test
+# is that this file is not migrated, converted or re-keyed on the way in.
+write("".join([
+    '{"v":1,"ts":"%s","five_hour_pct":32.5,"five_hour_reset":"%s",'
+    '"seven_day_pct":72,"seven_day_reset":"%s","context_pct":41.2,'
+    '"context_size":200000,"cost_usd":1.2345,"model_id":"claude-opus-5"}\n'
+    % (iso(NOW - timedelta(minutes=2)), iso(soon), iso(later))]))
+found = ledger.reading(path=LEDGER, now=NOW)
+check("an old two-window ledger reads exactly as it always did",
+      (found["five_hour"]["pct"], found["seven_day"]["pct"],
+       found["context_pct"], found["cost_usd"], found["model_id"]),
+      (32.5, 72, 41.2, 1.2345, "claude-opus-5"))
+check("and it holds two windows, not four and not a context one",
+      list(found["windows"]), ["five_hour", "seven_day"])
+check("context_pct has no reset, so it never becomes a window",
+      [w for w in found["windows"] if "context" in w], [])
+check("the gate answers on it unchanged",
+      gate.capacity(path=LEDGER, now=NOW, max_pct=80)["verdict"], gate.GO)
+check("and prints the same two-column layout it always printed",
+      gate._human(gate.capacity(path=LEDGER, now=NOW, max_pct=80)).splitlines()[1],
+      "  five-hour   32.5%  resets in 120 min  measured 2 min ago")
+
+print("\n== a window name is untrusted input becoming a key ==")
+hostile = {
+    "": (50, epoch),                          # empty
+    "  ": (50, epoch),                        # whitespace
+    "a" * 200: (50, epoch),                   # longer than any real name
+    "seven_day/../../etc": (50, epoch),       # path-ish
+    'quote"key': (50, epoch),                 # would need escaping
+    "new\nline": (50, epoch),
+    "null\x00byte": (50, epoch),
+    "sevén_day": (50, epoch),            # not ASCII
+    "_leading": (50, epoch),
+    "trailing_": (50, epoch),
+    "context": (50, epoch),                   # would collide with context_pct
+    "weird_pct": (50, epoch),                 # would become weird_pct_pct
+    "weird_reset": (50, epoch),
+}
+row = capture.build_row(json.loads(payload(five=10, five_reset=epoch,
+                                           windows=hostile)), now=NOW)
+check("not one hostile name becomes a key",
+      sorted(k for k in row if k.endswith("_pct")), ["five_hour_pct"])
+check("and the good window beside them is unharmed", row["five_hour_pct"], 10)
+check("the row still serialises to one line", capture._encode(row) is not None,
+      True)
+plausible = capture.build_row(json.loads(payload(
+    windows={"seven_day_haiku_45": (10, epoch)})), now=NOW)
+check("a plausible undocumented name IS accepted -- this is a filter, not a "
+      "whitelist", plausible.get("seven_day_haiku_45_pct"), 10.0)
+check("a window whose value is not an object is skipped, not crashed on",
+      [k for k in capture.build_row(json.loads(payload(
+          windows={"seven_day_opus": 99, "seven_day_sonnet": None})),
+          now=NOW) if k.endswith("_pct")], [])
+# The reader applies the same filter, because the ledger is an ingest surface.
+write([{"v": 1, "ts": iso(NOW), "five_hour_pct": 20,
+        "five_hour_reset": iso(soon),
+        ("z" * 200) + "_pct": 99, ("z" * 200) + "_reset": iso(soon),
+        "context_pct": 5, "context_reset": iso(soon)}])
+found = ledger.reading(path=LEDGER, now=NOW)
+check("a hand-edited ledger cannot put an absurd name in an answer",
+      list(found["windows"]), ["five_hour"])
+check("nor can it turn the context reading into a quota window",
+      found["context_pct"], 5)
+
+# A window whose reset cannot be read is a window with NO LIVE READING, which is
+# said out loud. Dropping it from the answer instead would leave a window at 96%
+# missing from the list -- absent in the direction that reads as room.
+write([{"v": 1, "ts": iso(NOW), "five_hour_pct": 20,
+        "five_hour_reset": iso(soon),
+        "seven_day_opus_pct": 96, "seven_day_opus_reset": "not a time"}])
+found = ledger.reading(path=LEDGER, now=NOW)
+check("a window with an unreadable reset is still named",
+      list(found["windows"]), ["five_hour", "seven_day_opus"])
+check("but it has no live reading, so it decides nothing",
+      found["windows"]["seven_day_opus"], None)
+answer = gate.capacity(path=LEDGER, now=NOW, max_pct=80)
+check("the gate answers on the window it can read", answer["verdict"], gate.GO)
+check("and prints the other one as unread rather than hiding it",
+      [l.split() for l in gate._human(answer).splitlines()
+       if l.strip().startswith("seven-day-opus")],
+      [["seven-day-opus", "no", "live", "reading"]])
+
+print("\n== how many windows one payload may decide ==")
+many = dict(("w%02d" % n, (float(n), epoch)) for n in range(1, 21))
+row = capture.build_row(json.loads(payload(windows=many)), now=NOW)
+check("a payload cannot decide how many windows a row carries",
+      len(capture.window_names(row)), capture.MAX_WINDOWS)
+check("and what survives the cap is the fullest, never the first sent",
+      sorted(round(row[k]) for k in row if k.endswith("_pct")),
+      list(range(21 - capture.MAX_WINDOWS, 21)))
+check("the tail may hold more names than any one payload sent",
+      ledger.MAX_WINDOW_NAMES > capture.MAX_WINDOWS, True)
+# Past the reader's cap too, and the excess is reported rather than dropped in
+# silence -- a window nobody mentions is the failure this whole change is about.
+write([dict([("v", 1), ("ts", iso(NOW))] +
+            [("w%03d_pct" % n, 1) for n in range(200)] +
+            [("w%03d_reset" % n, iso(soon)) for n in range(200)])])
+found = ledger.reading(path=LEDGER, now=NOW)
+check("one read accumulates no more names than its cap",
+      len(found["windows"]), ledger.MAX_WINDOW_NAMES)
+check("and says how many it had to refuse",
+      found["health"]["windows_ignored"], 200 - ledger.MAX_WINDOW_NAMES)
+check("which the printed answer states out loud",
+      "past the cap" in gate._human(gate.capacity(path=LEDGER, now=NOW)), True)
+
+print("\n== windows shed last, and the fullest window sheds last of all ==")
+# A row over MAX_ROW_BYTES sheds rather than being dropped whole. Cost, context
+# and model go first; only then do the windows go, least-used first, because the
+# highest percentage is the one that decides admission.
+crowded = capture.build_row(json.loads(payload(
+    five=3, week=7, five_reset=epoch, week_reset=epoch, context=50, cost=1.5,
+    model="claude-opus-5-with-a-deliberately-long-identifier",
+    windows=dict(("seven_day_model_number_%02d" % n, (float(n * 11), epoch))
+                 for n in range(1, 7)))), now=NOW)
+check("the crowded row really is over the cap before shedding",
+      len(json.dumps(crowded)) > capture.MAX_ROW_BYTES, True)
+check("and it is under the per-row window cap, so this tests shedding alone",
+      len(capture.window_names(crowded)) <= capture.MAX_WINDOWS, True)
+shed = json.loads(capture._encode(crowded).decode("utf-8"))
+check("cost, context and model go before any window does",
+      [k for k in ("cost_usd", "context_size", "model_id", "context_pct")
+       if k in shed], [])
+check("and the row that comes out fits",
+      len(capture._encode(crowded)) < capture.MAX_ROW_BYTES, True)
+survivors = sorted(shed[k] for k in shed if k.endswith("_pct"))
+offered = sorted(crowded[k] for k in crowded
+                 if k.endswith("_pct") and k != "context_pct")
+check("whatever room is left goes to the highest percentages, in order",
+      survivors, offered[-len(survivors):])
+check("so the fullest window is still there when the dust settles",
+      shed.get("seven_day_model_number_06_pct"), 66.0)
+check("and its reset went with it, not without it",
+      "seven_day_model_number_06_reset" in shed, True)
+# The rule is the percentage, not the pedigree: five-hour at 3% is shed while a
+# per-model window at 66% stays, because 66% is what would hold work back.
+check("a documented window at 3% goes before an undocumented one at 66%",
+      ("five_hour_pct" in shed, "seven_day_model_number_06_pct" in shed),
+      (False, True))
+check("a shed window loses both halves or neither",
+      sorted(k[:-4] for k in shed if k.endswith("_pct"))
+      == sorted(k[:-6] for k in shed if k.endswith("_reset")), True)
+# Down to the bone: twenty-nine windows in one row, most of which cannot fit.
+tiny = dict([("v", 1), ("ts", iso(NOW))]
+            + [("w%02d_pct" % n, float(n)) for n in range(1, 30)]
+            + [("w%02d_reset" % n, iso(soon)) for n in range(1, 30)])
+kept = json.loads(capture._encode(tiny).decode("utf-8"))
+check("when almost everything must go, the highest percentage is what stays",
+      ("w29_pct" in kept, "w01_pct" in kept), (True, False))
+check("and a row with nothing left to shed is refused rather than truncated",
+      capture._encode({"v": 1, "ts": iso(NOW), "note": "x" * 600}), None)
+
+print("\n== a per-model window moving outranks the throttle ==")
+# The throttle used to look at the two documented percentages only, so an Opus
+# allowance climbing while those two sat still was a movement nothing recorded.
+LEDGER.unlink(missing_ok=True)
+base = {"v": 1, "ts": iso(NOW), "five_hour_pct": 10,
+        "five_hour_reset": iso(soon), "seven_day_opus_pct": 40,
+        "seven_day_opus_reset": iso(later)}
+check("the first row is written", capture.append(dict(base), path=LEDGER),
+      "written")
+check("an unchanged row inside the minute is still throttled",
+      capture.append(dict(base), path=LEDGER), "throttled")
+moved = dict(base, seven_day_opus_pct=46)
+check("but a per-model window that moved is recorded",
+      capture.append(moved, path=LEDGER), "written")
 
 print("\n== the context rule needs a context reading it can date ==")
 # The context number never carried a measurement time, so --max-context was

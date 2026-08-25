@@ -38,11 +38,19 @@ being fifteen minutes earlier. Parse both sides or compare neither.
 An unreadable stamp sorts oldest instead of raising, and a torn line is counted
 rather than fatal, because a capacity read that throws takes down whatever asked.
 
-WHAT THIS DOES NOT KNOW: the two windows in WINDOWS below, and no others. They
-are the two the status-line payload documents. If a third is ever added, a
-payload where that third window is exhausted reads here as a payload with room
-in it -- silently, and in the expensive direction. That is the sharpest edge in
-this file, and it is a change in someone else's schema away.
+WHICH WINDOWS THERE ARE IS READ OFF THE ROWS, NOT LISTED HERE. This file used to
+hold a two-name tuple, and a window outside it read as a window with room in it
+-- silently, and in the expensive direction. That stopped being hypothetical:
+Claude Code 2.1.237 sends `seven_day_opus` and `seven_day_sonnet` beside the two
+documented windows (github.com/anthropics/claude-code/issues/88137). So a window
+is now anything in a row that looks like one: a key ending `_pct` with a
+matching `_reset`, whose name survives `capture._window_name`.
+
+`context_pct` is NOT one of them and never can be. It has no reset -- the
+context window is a property of the session in front of you rather than a
+rolling quota -- so the whole selection rule above, which turns on the reset,
+does not apply to it. It keeps the separate handling further down, and the
+missing `_reset` is what keeps it out of the window set on its own.
 """
 
 import json
@@ -58,7 +66,13 @@ except ImportError:
 
 import capture
 
-WINDOWS = ("five_hour", "seven_day")
+# How many distinct window names one read may accumulate. `capture` bounds a
+# single ROW to MAX_WINDOWS; this bounds the whole tail, which spans thousands
+# of rows and can straddle several Claude Code versions, so it is allowed more
+# names than any one payload sent -- four times as many. A name past the cap is
+# COUNTED and reported, never dropped in silence: a window nobody mentions is
+# precisely the failure this file was rewritten to stop.
+MAX_WINDOW_NAMES = 4 * capture.MAX_WINDOWS
 
 # Rotation. At one row a minute a busy month is a few megabytes, and every read
 # walks the file, so it is compacted rather than allowed to grow without limit.
@@ -157,10 +171,28 @@ def reading(path=None, now=None, tail=TAIL_ROWS):
     if not rows:
         return None
 
+    # EVERY window any row mentions gets a name here, whether or not it ends up
+    # with a live reading. A window whose observations have all expired, or
+    # whose reset will not parse, is a window with NO LIVE READING -- which is a
+    # thing to say out loud. Leaving it out instead would put a window back in
+    # the position this whole file was rewritten to get it out of: absent from
+    # the answer, and absent in the direction that reads as room.
+    #
+    # Naming a window is not the same as gating on it. A window with no live
+    # reading is reported and decides nothing, exactly as before.
+    #
+    # `known` is a dict used as an ordered set, purely for its membership test:
+    # the check below runs once per window per row, thousands of times a call.
+    known, refused = {}, set()
     best = {}
     for index, row in enumerate(rows):
         seen_at = _instant(row.get("ts"))
-        for window in WINDOWS:
+        for window in capture._named_windows(row):
+            if window not in known:
+                if len(known) >= MAX_WINDOW_NAMES:
+                    refused.add(window)
+                    continue
+                known[window] = True
             pct = capture._pct(row.get(window + "_pct"))
             reset_raw = row.get(window + "_reset")
             if pct is None or not isinstance(reset_raw, str) or not reset_raw.strip():
@@ -255,7 +287,7 @@ def reading(path=None, now=None, tail=TAIL_ROWS):
 
     # WHEN the context number was measured, so that something can check it.
     # Without this the --max-context rule was applied to a reading of unbounded
-    # age: the staleness check covered the two quota windows, the context number
+    # age: the staleness check covered the quota windows, the context number
     # carried no measurement time at all, and so a context percentage from
     # yesterday's session decided today's answer with nothing able to notice and
     # nothing reporting it. The gate applies the same freshness rule to this.
@@ -264,20 +296,30 @@ def reading(path=None, now=None, tail=TAIL_ROWS):
         context_age = round((now - context_key[0]).total_seconds() / 60.0, 1)
 
     out = {"health": {"rows": len(rows), "unreadable": unreadable,
+                      "windows_ignored": len(refused),
                       "newest": None if newest is None else newest.isoformat()},
            "context_pct": context, "context_measured_at": context_measured_at,
            "context_age_minutes": context_age,
            "cost_usd": cost, "model_id": model}
-    for window in WINDOWS:
+    windows = {}
+    for window in capture.order_windows(known):
         found = best.get(window)
         if not found:
-            out[window] = None
+            windows[window] = None
             continue
         age = (now - _instant(found["measured_at"])).total_seconds() / 60.0
-        out[window] = {"pct": found["pct"], "reset": found["reset"],
-                       "measured_at": found["measured_at"],
-                       "age_minutes": round(age, 1)}
-    if out["five_hour"] is None and out["seven_day"] is None and context is None:
+        windows[window] = {"pct": found["pct"], "reset": found["reset"],
+                           "measured_at": found["measured_at"],
+                           "age_minutes": round(age, 1)}
+    out["windows"] = windows
+    # `five_hour` and `seven_day` also stay where they have always been, as the
+    # SAME objects rather than copies, so they cannot drift from the dict above.
+    # Every caller and every stored reading that predates per-model windows goes
+    # on working; `windows` is the authoritative list, and anything that wants to
+    # know what exists must read that, because these two are only ever these two.
+    for window in capture.DOCUMENTED_WINDOWS:
+        out[window] = windows.get(window)
+    if not any(windows.values()) and context is None:
         return None
     return out
 
