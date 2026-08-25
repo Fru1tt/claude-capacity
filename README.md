@@ -2,8 +2,15 @@
 
 Stop your Claude Code automation from launching into an empty tank.
 
-It reads the quota numbers Claude Code already gives your status line, keeps them
-in a local file, and answers with an exit code.
+You run Claude Code on a subscription, and something scheduled runs without you
+— a nightly agent in cron, a long batch job, an automation working while you
+sleep. It starts whether or not the quota can carry it. Launched with the week
+at 96%, it burns what is left, dies partway through, and the session you sit
+down to in the morning opens against a spent limit.
+
+This puts a guard in front of the job. It reads the quota numbers Claude Code
+already gives your status line, keeps them in a local file, and answers with an
+exit code — so the job below only starts when there is room:
 
 ```console
 $ python3 gate.py check --max-pct 80 --quiet && ./run-the-overnight-job
