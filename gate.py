@@ -100,21 +100,29 @@ def _protect_arg(text):
     return (hour, minute)
 
 
-def _protect_why(protect, now):
-    """The reason to wait, or None: would a job started now still hold its
-    five-hour window when the protected wall-clock time arrives?
+def _protect_why(protect, now, slack=0):
+    """The reason to wait, or None: would a job started now hold its five-hour
+    window more than `slack` minutes past the protected wall-clock time?
 
-    The protected time is read on the clock `now` carries -- from the command
-    line that is this machine's local time. The next occurrence is found at
-    `now`'s own UTC offset, so on the one night a year the clocks change the
-    boundary can be off by an hour; that is accepted rather than taking a
-    timezone database for one comparison.
+    The refusal is about OVERHANG, not existence: a window that dies minutes
+    after the protected hour steals no morning, so a slack of 120 tolerates a
+    window running up to two hours past it, and a slack of zero is the strict
+    rule. The protected time is read on the clock `now` carries -- from the
+    command line that is this machine's local time. The next occurrence is
+    found at `now`'s own UTC offset, so on the one night a year the clocks
+    change the boundary can be off by an hour; that is accepted rather than
+    taking a timezone database for one comparison.
     """
     hour, minute = protect
     candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if candidate <= now:
         candidate += timedelta(days=1)
-    if candidate - now <= timedelta(minutes=FIVE_HOUR_WINDOW_MINUTES):
+    overhang = FIVE_HOUR_WINDOW_MINUTES - (candidate - now).total_seconds() / 60
+    if overhang > slack:
+        if slack:
+            return ("a job started now would hold its five-hour window %.0f "
+                    "minutes past %02d:%02d, more than the %d tolerated"
+                    % (overhang, hour, minute, slack))
         return ("a job started now would still hold its five-hour window at "
                 "%02d:%02d, and that hour is protected" % (hour, minute))
     return None
@@ -122,7 +130,7 @@ def _protect_why(protect, now):
 
 def capacity(path=None, now=None, max_pct=DEFAULT_MAX_PCT,
              max_age_minutes=DEFAULT_MAX_AGE_MINUTES, max_context_pct=None,
-             protect=None):
+             protect=None, protect_slack=0):
     """The structured answer. Always a dict, never an exception.
 
     `verdict` is GO, WAIT or UNKNOWN. `why` says which rule decided it, in words
@@ -136,10 +144,11 @@ def capacity(path=None, now=None, max_pct=DEFAULT_MAX_PCT,
            "context_measured_at": None, "context_age_minutes": None,
            "cost_usd": None, "model_id": None, "health": None,
            "max_pct": max_pct, "max_age_minutes": max_age_minutes,
-           "protect": "%02d:%02d" % protect if protect else None}
+           "protect": "%02d:%02d" % protect if protect else None,
+           "protect_slack": protect_slack if protect else None}
     # The protected hour outranks everything, including not knowing: a job
     # refused for the morning's sake is refused whatever the ledger says.
-    protect_why = _protect_why(protect, now) if protect else None
+    protect_why = _protect_why(protect, now, protect_slack) if protect else None
     if not found:
         if protect_why:
             out["verdict"] = WAIT
@@ -345,6 +354,10 @@ def main(argv=None):
                        metavar="HH:MM",
                        help="wait if a job started now would still hold its "
                             "five-hour window at this local time of day")
+    check.add_argument("--protect-slack", type=int, default=None,
+                       dest="protect_slack", metavar="MINUTES",
+                       help="tolerate a window running up to this many "
+                            "minutes past the protected time")
     check.add_argument("--allow-unknown", action="store_true",
                        help="exit 0 when capacity cannot be established")
     check.add_argument("--json", action="store_true", help="print the full answer")
@@ -382,8 +395,17 @@ def main(argv=None):
         print(ledger.compact())
         return 0
 
+    if args.protect_slack is not None:
+        # A slack has to modify a protected hour, and it has to leave one: a
+        # typo here must fail loudly rather than silently unprotect a morning.
+        if args.protect is None:
+            parser.error("--protect-slack needs --protect")
+        if not 0 <= args.protect_slack < FIVE_HOUR_WINDOW_MINUTES:
+            parser.error("a slack of %d minutes leaves nothing protected -- "
+                         "it must be between 0 and 299" % args.protect_slack)
     answer = capacity(max_pct=args.max_pct, max_age_minutes=args.max_age,
-                      max_context_pct=args.max_context, protect=args.protect)
+                      max_context_pct=args.max_context, protect=args.protect,
+                      protect_slack=args.protect_slack or 0)
     if not args.quiet:
         if args.json:
             print(json.dumps(answer, indent=2, default=str))

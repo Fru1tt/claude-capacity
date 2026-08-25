@@ -1037,6 +1037,41 @@ check("a time that is not a time is refused loudly at the flag",
       refused, "ArgumentTypeError")
 check("while a real one parses", gate._protect_arg("08:00"), (8, 0))
 
+def _exit_code(call):
+    try:
+        return call()
+    except SystemExit as err:
+        return err.code
+
+
+# == slack makes the protected hour honest instead of paranoid ==
+# A window still open at eight that dies minutes later steals no morning.
+# --protect-slack N tolerates a window running up to N minutes past the
+# protected time, so the refusal is about overhang, not existence. Slack
+# zero is exactly the old rule.
+check("a window running 30 minutes past eight is fine inside a 120 slack",
+      gate.capacity(path=PROTECT_LEDGER, now=NOW_P.replace(hour=3, minute=30),
+                    max_age_minutes=1440, protect=(8, 0),
+                    protect_slack=120)["verdict"], gate.GO)
+check("one running two and a half hours past is not",
+      gate.capacity(path=PROTECT_LEDGER, now=NOW_P.replace(hour=5, minute=30),
+                    max_age_minutes=1440, protect=(8, 0),
+                    protect_slack=120)["verdict"], gate.WAIT)
+check("and the reason names the overhang",
+      "past" in gate.capacity(path=PROTECT_LEDGER,
+                              now=NOW_P.replace(hour=5, minute=30),
+                              max_age_minutes=1440, protect=(8, 0),
+                              protect_slack=120)["why"], True)
+check("overhang exactly equal to the slack is tolerated",
+      gate.capacity(path=PROTECT_LEDGER, now=NOW_P.replace(hour=3, minute=30),
+                    max_age_minutes=1440, protect=(8, 0),
+                    protect_slack=30)["verdict"], gate.GO)
+check("slack without a protected hour is a loud usage error",
+      _exit_code(lambda: gate.main(["check", "--protect-slack", "60"])), 2)
+check("a slack that swallows the whole window is refused the same way",
+      _exit_code(lambda: gate.main(["check", "--protect", "08:00",
+                                    "--protect-slack", "300"])), 2)
+
 # == the recorder trims the file it just grew past the cap ==
 # `compact` exists, but nothing schedules it: a ledger written by months of
 # renders grows until someone remembers a maintenance command. The recorder is
